@@ -82,6 +82,7 @@ async fn enquote(ctx: ErrorContext<'_>) -> Result<(), Error> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok().context("failed to retrieve .env variables")?;
     let token = std::env::var("DISCORD_TOKEN").context("failed to retrieve discord bot token")?;
     let quotes_channel: u64 = std::env::var("TARGET_CHANNEL_ID")
         .context("failed to retrieve target channel id")?
