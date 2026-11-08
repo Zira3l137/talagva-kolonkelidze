@@ -11,7 +11,7 @@ use serenity::builder::{
     CreateInteractionResponseMessage, CreateMessage, EditMessage,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::CommandContext;
 use super::{Action, Category, Game, Kind, Phase, Transition, draw};
@@ -48,6 +48,24 @@ pub(crate) async fn create_lobby(ctx: CommandContext<'_>, category: Category) ->
     let channel = ctx.channel_id();
     let actor = ctx.author().id;
     let games = &ctx.data().games;
+    // Abandoned sessions should not block this channel forever.
+    if let Some(previous) = games.find(channel).await {
+        let old = previous.lock().await;
+        if old.is_expired() {
+            if let Some(message_id) = old.message_id {
+                if let Err(error) = channel.edit_message(ctx.http(), message_id,
+                    EditMessage::new()
+                        .content(finished_message("timed out after two hours of inactivity"))
+                        .components(Vec::new()).allowed_mentions(no_pings())).await
+                {
+                    warn!(%channel, error = ?error, "could not disable buttons on expired lobby");
+                }
+            }
+            drop(old);
+            games.remove_if_current(channel, &previous).await;
+        }
+    }
+
     let id = games.next_id.fetch_add(1, Ordering::Relaxed) + 1;
     let session = Arc::new(Mutex::new(Game::new(id, actor, category)));
     {
@@ -150,18 +168,22 @@ pub(crate) async fn on_component(
         return Ok(());
     }
 
-    let result = match game.apply(component.user.id, action) {
+    // Stage changes on a copy. If Discord rejects the update, the actual
+    // game stays on the old turn and the player can retry safely.
+    let mut updated = game.clone();
+    let result = match updated.apply(component.user.id, action) {
         Ok(result) => result,
         Err(message) => return private_reply(ctx, component, message).await,
     };
     let response = match result {
-        Transition::Updated => View::from_game(&game).into_response(),
+        Transition::Updated => View::from_game(&updated).into_response(),
         Transition::Ended => CreateInteractionResponseMessage::new()
             .content(finished_message("ended by the host"))
             .components(Vec::new()).allowed_mentions(no_pings()),
     };
     component.create_response(ctx, CreateInteractionResponse::UpdateMessage(response))
         .await.context("failed to update Truth or Dare game message")?;
+    *game = updated;
 
     debug!(%channel, session_id, user_id = %component.user.id, ?action, ?result, "game action accepted");
     if result == Transition::Ended {
@@ -183,7 +205,7 @@ async fn private_reply(
 }
 
 fn no_pings() -> CreateAllowedMentions {
-    CreateAllowedMentions::new().empty_users().empty_roles().everyone(false)
+    CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false)
 }
 
 fn finished_message(reason: &str) -> String {
@@ -214,7 +236,7 @@ impl View {
             Phase::Choosing => {
                 content.push_str(&format!(
                     "\n**Round {}** · <@{}>'s turn.\nChoose **Truth** or **Dare**.\n",
-                    game.round, game.current_player().unwrap().get(),
+                    game.round, game.current_player().expect("active game needs a current player").get(),
                 ));
                 vec![(Action::Truth, "Truth"), (Action::Dare, "Dare"),
                      (Action::Skip, "Skip Turn"), (Action::Stop, "End Game")]
@@ -222,7 +244,7 @@ impl View {
             Phase::Challenge { kind, prompt } => {
                 content.push_str(&format!(
                     "\n**Round {}** · <@{}>'s turn.\n**{}:** {prompt}\n\n",
-                    game.round, game.current_player().unwrap().get(), kind.label(),
+                    game.round, game.current_player().expect("active game needs a current player").get(), kind.label(),
                 ));
                 content.push_str("Complete your prompt or skip it. The host can skip an inactive player's turn.");
                 vec![(Action::Complete, "Completed"), (Action::Skip, "Skip Turn"),

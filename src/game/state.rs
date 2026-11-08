@@ -68,7 +68,7 @@ pub(crate) enum Transition {
     Ended,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Game {
     pub id: u64,
     pub host: UserId,
@@ -207,7 +207,7 @@ impl Game {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Category, Game, Kind, MAX_PLAYERS, Phase, Transition, UserId};
+    use super::{Action, Category, Game, Kind, MAX_PLAYERS, Phase, Transition, UserId, IDLE_TIMEOUT};
 
     fn user(id: u64) -> UserId {
         UserId::new(id)
@@ -258,6 +258,15 @@ mod tests {
         assert_eq!(game.current_player(), Some(current));
         assert_eq!(game.round, 3);
         assert!(game.apply(other, Action::Join).is_err());
+    }
+
+    #[test]
+    fn activity_refreshes_and_sessions_expire() {
+        let mut game = Game::new(99, user(1), Category::Casual);
+        game.last_activity = std::time::Instant::now() - IDLE_TIMEOUT;
+        assert!(game.is_expired());
+        game.apply(user(2), Action::Join).unwrap();
+        assert!(!game.is_expired());
     }
 
     #[test]
