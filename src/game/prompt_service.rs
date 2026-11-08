@@ -2,9 +2,13 @@
 //!
 //! Discord component responses must be sent promptly. We never wait for a
 //! model response during a button press: the cache refills asynchronously.
+//!
+//! Unused prompts are saved to disk, so a restart neither loses prompts that
+//! were already paid for nor requests new ones for categories nobody plays.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -12,6 +16,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
 use super::groq::Groq;
+use super::store::{BucketData, Snapshot, Store, bucket_key};
 use super::{Category, Kind, draw, random};
 use crate::config::GroqConfig;
 
@@ -24,6 +29,9 @@ const RECENT_LIMIT: usize = 24;
 const HISTORY_SENT: usize = 6;
 const RETRY_DELAY: Duration = Duration::from_secs(90);
 
+const CATEGORIES: [Category; 3] = [Category::Casual, Category::Personal, Category::Romantic];
+const KINDS: [Kind; 2] = [Kind::Truth, Kind::Dare];
+
 #[derive(Default)]
 pub(crate) struct PromptService {
     ai: Option<Arc<Cache>>,
@@ -31,6 +39,12 @@ pub(crate) struct PromptService {
 
 struct Cache {
     provider: Groq,
+    language: String,
+    store: Arc<Store>,
+    /// Buckets for other languages, kept verbatim so that switching
+    /// `TOD_LANGUAGE` never discards prompts that were already generated.
+    foreign: BTreeMap<String, BucketData>,
+    snapshots: AtomicU64,
     buckets: Mutex<HashMap<(Category, Kind), Bucket>>,
     // Keep free-tier usage predictable, including on first warmup.
     limit: Semaphore,
@@ -44,33 +58,50 @@ struct Bucket {
     retry_at: Option<Instant>,
 }
 
+/// A serialized snapshot waiting to be written by a blocking task.
+struct Write {
+    seq: u64,
+    json: String,
+}
+
+impl Bucket {
+    fn from_data(data: BucketData) -> Self {
+        let mut recently_used: VecDeque<String> = data.recent.into_iter().collect();
+        while recently_used.len() > RECENT_LIMIT {
+            recently_used.pop_front();
+        }
+        Self {
+            ready: data.ready.into_iter().filter(|prompt| !prompt.trim().is_empty()).collect(),
+            recently_used,
+            ..Self::default()
+        }
+    }
+
+    fn to_data(&self) -> BucketData {
+        BucketData {
+            ready: self.ready.iter().cloned().collect(),
+            recent: self.recently_used.iter().cloned().collect(),
+        }
+    }
+}
+
 impl PromptService {
     pub fn new(config: Option<GroqConfig>) -> Result<Self> {
         let ai = config
-            .map(|config| -> Result<Arc<Cache>> {
-                Ok(Arc::new(Cache {
-                    provider: Groq::new(config)?,
-                    buckets: Mutex::new(HashMap::new()),
-                    limit: Semaphore::new(1),
-                }))
-            })
+            .map(|config| Cache::open(config).map(Arc::new))
             .transpose()?;
         Ok(Self { ai })
     }
 
-    /// Warm every combination in the background without delaying bot startup.
+    /// Top up categories that were already being played, without delaying
+    /// bot startup. Nothing is requested for categories nobody has used.
     pub fn warm(&self) {
         let Some(ai) = &self.ai else {
             info!("Groq is not configured; using curated Truth or Dare prompts");
             return;
         };
-        info!("Groq prompt generation enabled; starting background cache warmup");
-        for category in [Category::Casual, Category::Personal, Category::Romantic] {
-            for kind in [Kind::Truth, Kind::Dare] {
-                let ai = Arc::clone(ai);
-                tokio::spawn(async move { ai.ensure_refill(category, kind).await });
-            }
-        }
+        let ai = Arc::clone(ai);
+        tokio::spawn(async move { ai.warm().await });
     }
 
     pub async fn draw(&self, category: Category, kind: Kind, previous: Option<&str>) -> String {
@@ -84,6 +115,47 @@ impl PromptService {
 }
 
 impl Cache {
+    fn open(config: GroqConfig) -> Result<Self> {
+        let language = config.language.clone();
+        let store = Store::new(config.store_path.clone());
+        let mut snapshot = store.load();
+
+        let mut buckets = HashMap::new();
+        let mut loaded = 0;
+        for category in CATEGORIES {
+            for kind in KINDS {
+                if let Some(data) = snapshot.buckets.remove(&bucket_key(&language, category, kind)) {
+                    let bucket = Bucket::from_data(data);
+                    loaded += bucket.ready.len();
+                    buckets.insert((category, kind), bucket);
+                }
+            }
+        }
+        info!(path = %store.path().display(), loaded, language = language.as_str(),
+            "loaded saved AI prompts");
+
+        Ok(Self {
+            provider: Groq::new(config)?,
+            language,
+            store: Arc::new(store),
+            foreign: snapshot.buckets,
+            snapshots: AtomicU64::new(0),
+            buckets: Mutex::new(buckets),
+            limit: Semaphore::new(1),
+        })
+    }
+
+    async fn warm(self: &Arc<Self>) {
+        let played = {
+            let buckets = self.buckets.lock().await;
+            played_buckets(&buckets)
+        };
+        info!(played = played.len(), "Groq prompt generation enabled; refilling categories in play");
+        for (category, kind) in played {
+            self.ensure_refill(category, kind).await;
+        }
+    }
+
     async fn take(self: &Arc<Self>, category: Category, kind: Kind, previous: Option<&str>) -> Option<String> {
         let mut buckets = self.buckets.lock().await;
         let bucket = buckets.entry((category, kind)).or_default();
@@ -102,7 +174,9 @@ impl Cache {
             }
             prompt
         };
+        let write = prompt.is_some().then(|| self.snapshot(&buckets)).flatten();
         drop(buckets);
+        self.persist(write);
         self.ensure_refill(category, kind).await;
         prompt
     }
@@ -137,6 +211,7 @@ impl Cache {
         let mut buckets = self.buckets.lock().await;
         let bucket = buckets.entry((category, kind)).or_default();
         bucket.loading = false;
+        let mut write = None;
         match result {
             Ok(prompts) => {
                 let generated = prompts.len();
@@ -153,6 +228,9 @@ impl Cache {
                 bucket.retry_at = if added == 0 { Some(Instant::now() + RETRY_DELAY) } else { None };
                 info!(category = category.label(), kind = kind.label(), generated, added, duplicates,
                     "AI prompt cache refilled");
+                if added > 0 {
+                    write = self.snapshot(&buckets);
+                }
             }
             Err(error) => {
                 bucket.retry_at = Some(Instant::now() + RETRY_DELAY);
@@ -160,7 +238,48 @@ impl Cache {
                     "Groq refill failed; curated prompts remain available");
             }
         }
+        drop(buckets);
+        self.persist(write);
     }
+
+    /// Serialize the whole cache. Called with the bucket lock held so that the
+    /// sequence number reflects the order in which states existed.
+    fn snapshot(&self, buckets: &HashMap<(Category, Kind), Bucket>) -> Option<Write> {
+        let mut snapshot = Snapshot::new();
+        snapshot.buckets = self.foreign.clone();
+        for (&(category, kind), bucket) in buckets {
+            if bucket.ready.is_empty() && bucket.recently_used.is_empty() {
+                continue;
+            }
+            snapshot.buckets.insert(bucket_key(&self.language, category, kind), bucket.to_data());
+        }
+        match snapshot.to_json() {
+            Ok(json) => Some(Write { seq: self.snapshots.fetch_add(1, Ordering::Relaxed) + 1, json }),
+            Err(error) => {
+                warn!(error = ?error, "could not serialize the AI prompt cache");
+                None
+            }
+        }
+    }
+
+    /// Write on a blocking thread: a button press never waits for the disk.
+    fn persist(&self, write: Option<Write>) {
+        let Some(Write { seq, json }) = write else { return };
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = store.save(seq, &json) {
+                warn!(error = ?error, "could not save the AI prompt cache");
+            }
+        });
+    }
+}
+
+/// Buckets somebody has already played: only these are worth refilling at startup.
+fn played_buckets(buckets: &HashMap<(Category, Kind), Bucket>) -> Vec<(Category, Kind)> {
+    buckets.iter()
+        .filter(|(_, bucket)| !bucket.recently_used.is_empty())
+        .map(|(&key, _)| key)
+        .collect()
 }
 
 fn remember(recent: &mut VecDeque<String>, prompt: &str) {
@@ -178,8 +297,28 @@ fn history_for_request(recent: &VecDeque<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use super::{HISTORY_SENT, RECENT_LIMIT, history_for_request, remember};
+    use std::collections::{HashMap, VecDeque};
+    use std::fs;
+
+    use super::super::store::testing::temp_path;
+    use super::{
+        Bucket, Cache, Category, GroqConfig, HISTORY_SENT, Kind, RECENT_LIMIT, history_for_request,
+        played_buckets, remember,
+    };
+
+    fn config(language: &str, name: &str) -> GroqConfig {
+        GroqConfig {
+            key: "test-key".into(),
+            model: "test-model".into(),
+            language: language.into(),
+            store_path: temp_path(name),
+        }
+    }
+
+    fn cleanup(config: &GroqConfig) {
+        let _ = fs::remove_file(&config.store_path);
+        let _ = fs::remove_file(format!("{}.tmp", config.store_path.display()));
+    }
 
     #[tokio::test]
     async fn without_key_uses_curated_prompts() {
@@ -212,5 +351,59 @@ mod tests {
         // A short history is sent in full.
         let short: VecDeque<String> = ["a".to_owned(), "b".to_owned()].into();
         assert_eq!(history_for_request(&short), ["a", "b"]);
+    }
+
+    #[test]
+    fn only_played_buckets_are_warmed() {
+        let mut buckets = HashMap::new();
+        let mut played = Bucket::default();
+        played.recently_used.push_back("served once".into());
+        buckets.insert((Category::Casual, Kind::Truth), played);
+        // Prompts that were generated but never served do not justify a request.
+        let mut stocked = Bucket::default();
+        stocked.ready.push_back("never served".into());
+        buckets.insert((Category::Romantic, Kind::Dare), stocked);
+        buckets.insert((Category::Personal, Kind::Truth), Bucket::default());
+        assert_eq!(played_buckets(&buckets), [(Category::Casual, Kind::Truth)]);
+    }
+
+    #[tokio::test]
+    async fn cache_survives_a_restart_and_keeps_other_languages() {
+        let georgian = config("ka", "restart-ka");
+        {
+            let cache = Cache::open(config("ka", "restart-ka")).unwrap();
+            let mut buckets = cache.buckets.lock().await;
+            let bucket = buckets.entry((Category::Casual, Kind::Truth)).or_default();
+            // Enough stock that serving one prompt starts no network refill.
+            for index in 0..5 {
+                bucket.ready.push_back(format!("ready {index}"));
+            }
+            bucket.recently_used.push_back("served".into());
+            let write = cache.snapshot(&buckets).unwrap();
+            drop(buckets);
+            cache.store.save(write.seq, &write.json).unwrap();
+        }
+
+        // Same file, same language: everything is restored.
+        let cache = Cache::open(config("ka", "restart-ka")).unwrap();
+        {
+            let buckets = cache.buckets.lock().await;
+            let bucket = &buckets[&(Category::Casual, Kind::Truth)];
+            assert_eq!(bucket.ready.len(), 5);
+            assert_eq!(bucket.recently_used, ["served"]);
+        }
+
+        // Another language starts empty, and saving does not discard Georgian prompts.
+        let english = Cache::open(config("en", "restart-ka")).unwrap();
+        {
+            let buckets = english.buckets.lock().await;
+            assert!(buckets.is_empty());
+            let write = english.snapshot(&buckets).unwrap();
+            english.store.save(write.seq, &write.json).unwrap();
+        }
+        let again = Cache::open(config("ka", "restart-ka")).unwrap();
+        assert_eq!(again.buckets.lock().await[&(Category::Casual, Kind::Truth)].ready.len(), 5);
+
+        cleanup(&georgian);
     }
 }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::{env, io};
 
 use anyhow::{Context as _, Result, ensure};
@@ -14,6 +15,8 @@ pub(crate) struct GroqConfig {
     pub key: String,
     pub model: String,
     pub language: String,
+    /// JSON file where generated prompts are saved between restarts.
+    pub store_path: PathBuf,
 }
 
 /// The .env file is optional when a host sets variables itself (e.g. Termux).
@@ -39,7 +42,10 @@ impl Config {
                 ensure!(!model.trim().is_empty(), "GROQ_MODEL cannot be empty");
                 let language = env::var("TOD_LANGUAGE").unwrap_or_else(|_| "ka".into());
                 ensure!(matches!(language.as_str(), "ka" | "en"), "TOD_LANGUAGE must be ka or en");
-                Some(GroqConfig { key, model, language })
+                let store_path = env::var("PROMPT_STORE_PATH")
+                    .unwrap_or_else(|_| "prompt_store.json".into());
+                ensure!(!store_path.trim().is_empty(), "PROMPT_STORE_PATH cannot be empty");
+                Some(GroqConfig { key, model, language, store_path: PathBuf::from(store_path) })
             }
             Err(env::VarError::NotPresent) => None,
             Err(error) => return Err(error).context("failed to read GROQ_API_KEY"),

@@ -5,6 +5,7 @@ mod prompt_service;
 mod prompts;
 mod random;
 mod state;
+mod store;
 
 pub(crate) mod discord;
 
