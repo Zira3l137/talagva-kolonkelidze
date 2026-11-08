@@ -68,6 +68,51 @@ pub(crate) enum Transition {
     Ended,
 }
 
+/// The longest written response a player may submit.
+pub(crate) const MAX_RESPONSE_CHARS: usize = 1000;
+
+const NO_CHALLENGE: &str = "There isn't a challenge to complete yet.";
+
+/// Everything worth keeping about a finished turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletedTurn {
+    pub player: UserId,
+    pub round: u32,
+    pub kind: Kind,
+    pub prompt: String,
+    /// `None` when the player left the response empty (for example, a spoken dare).
+    pub response: Option<String>,
+}
+
+/// Custom ID of the response form. It names the round so that a form left
+/// open while the turn moved on can never be recorded against a later challenge.
+pub(crate) fn response_id(session_id: u64, round: u32) -> String {
+    format!("tod:{session_id}:response:{round}")
+}
+
+pub(crate) fn parse_response_id(raw: &str) -> Option<(u64, u32)> {
+    let mut parts = raw.split(':');
+    if parts.next()? != "tod" {
+        return None;
+    }
+    let session_id = parts.next()?.parse().ok()?;
+    if parts.next()? != "response" {
+        return None;
+    }
+    let round = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((session_id, round))
+}
+
+/// Trim a submitted response; blank means no response, overlong text is cut.
+pub(crate) fn normalize_response(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cut: String = trimmed.chars().take(MAX_RESPONSE_CHARS).collect();
+    Some(cut.trim_end().to_owned())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Game {
     pub id: u64,
@@ -108,6 +153,39 @@ impl Game {
 
     pub fn last_prompt(&self) -> Option<&str> {
         self.last_prompt.as_deref()
+    }
+
+    /// Whether `actor` may finish the current challenge right now.
+    pub fn can_complete(&self, actor: UserId) -> Result<(), &'static str> {
+        self.require_turn(actor)?;
+        if matches!(&self.phase, Phase::Challenge { .. }) {
+            Ok(())
+        } else {
+            Err(NO_CHALLENGE)
+        }
+    }
+
+    /// Finish the current challenge with an optional written response and pass
+    /// the turn on. The returned record is what the channel should keep.
+    pub fn complete_turn(
+        &mut self,
+        actor: UserId,
+        response: Option<String>,
+    ) -> Result<CompletedTurn, &'static str> {
+        self.require_turn(actor)?;
+        let Phase::Challenge { kind, prompt } = self.phase.clone() else {
+            return Err(NO_CHALLENGE);
+        };
+        let completed = CompletedTurn {
+            player: actor,
+            round: self.round,
+            kind,
+            prompt,
+            response: response.as_deref().and_then(normalize_response),
+        };
+        self.advance();
+        self.last_activity = Instant::now();
+        Ok(completed)
     }
 
     #[cfg(test)]
@@ -189,11 +267,7 @@ impl Game {
                 Transition::Updated
             }
             A::Complete => {
-                self.require_turn(actor)?;
-                if !matches!(&self.phase, Phase::Challenge { .. }) {
-                    return Err("There isn't a challenge to complete yet.");
-                }
-                self.advance();
+                self.complete_turn(actor, None)?;
                 Transition::Updated
             }
             A::Skip => {
@@ -354,5 +428,82 @@ mod ai_prompt_tests {
         assert!(game.apply_with_prompt(actor, Action::Truth, Some("invalid prompt".to_owned())).is_err());
         assert_eq!(game.last_prompt(), None);
         assert_eq!(game.phase, Phase::Choosing);
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    /// A two-player game on the current player's challenge, plus the other player.
+    fn challenge(prompt: &str) -> (Game, UserId, UserId) {
+        let mut game = Game::new(5, UserId::new(1), Category::Casual);
+        game.apply(UserId::new(2), Action::Join).unwrap();
+        game.apply(UserId::new(1), Action::Begin).unwrap();
+        let current = game.current_player().unwrap();
+        let other = if current == UserId::new(1) { UserId::new(2) } else { UserId::new(1) };
+        game.apply_with_prompt(current, Action::Truth, Some(prompt.to_owned())).unwrap();
+        (game, current, other)
+    }
+
+    #[test]
+    fn completing_records_the_question_and_response_and_advances() {
+        let (mut game, current, other) = challenge("What is your favorite word?");
+        let done = game.complete_turn(current, Some("  Serendipity \n".to_owned())).unwrap();
+        assert_eq!(done, CompletedTurn {
+            player: current,
+            round: 1,
+            kind: Kind::Truth,
+            prompt: "What is your favorite word?".to_owned(),
+            response: Some("Serendipity".to_owned()),
+        });
+        assert_eq!(game.round, 2);
+        assert_eq!(game.phase, Phase::Choosing);
+        assert_eq!(game.current_player(), Some(other));
+    }
+
+    #[test]
+    fn an_empty_response_is_allowed_for_spoken_dares() {
+        let (mut game, current, _) = challenge("Sing a line.");
+        let done = game.complete_turn(current, Some("   ".to_owned())).unwrap();
+        assert_eq!(done.response, None);
+        let (mut game2, current2, _) = challenge("Sing a line.");
+        assert_eq!(game2.complete_turn(current2, None).unwrap().response, None);
+        assert_eq!(game.round, 2);
+    }
+
+    #[test]
+    fn only_the_current_player_can_complete_and_only_during_a_challenge() {
+        let (mut game, current, other) = challenge("A question here.");
+        assert_eq!(game.can_complete(other), Err("Only the current player can use this button."));
+        assert!(game.complete_turn(other, Some("sneaky".to_owned())).is_err());
+        // A rejected attempt changes nothing.
+        assert_eq!(game.round, 1);
+        assert!(matches!(game.phase, Phase::Challenge { .. }));
+        assert_eq!(game.can_complete(current), Ok(()));
+
+        game.complete_turn(current, None).unwrap();
+        // The next player is still choosing: nothing to complete yet.
+        assert_eq!(game.can_complete(other), Err("There isn't a challenge to complete yet."));
+        assert_eq!(game.complete_turn(other, None), Err("There isn't a challenge to complete yet."));
+    }
+
+    #[test]
+    fn long_responses_are_cut_and_blank_ones_dropped() {
+        assert_eq!(normalize_response(""), None);
+        assert_eq!(normalize_response(" \n\t "), None);
+        let long = "ა".repeat(MAX_RESPONSE_CHARS + 50);
+        assert_eq!(normalize_response(&long).unwrap().chars().count(), MAX_RESPONSE_CHARS);
+    }
+
+    #[test]
+    fn response_ids_are_strict_and_name_the_round() {
+        assert_eq!(parse_response_id(&response_id(42, 7)), Some((42, 7)));
+        assert_eq!(parse_response_id("tod:42:response"), None);
+        assert_eq!(parse_response_id("tod:42:response:7:extra"), None);
+        assert_eq!(parse_response_id("tod:42:join:7"), None);
+        assert_eq!(parse_response_id("other:42:response:7"), None);
+        // Button IDs and response IDs never collide.
+        assert_eq!(Action::parse(&response_id(42, 7)), None);
     }
 }

@@ -15,17 +15,27 @@ pub(crate) async fn run(config: Config) -> Result<()> {
             commands: vec![commands::enquote(), commands::tod()],
             event_handler: |framework, event| {
                 Box::pin(async move {
-                    if let serenity::FullEvent::InteractionCreate {
-                        interaction: serenity::Interaction::Component(component),
-                    } = event
-                    {
-                        game::discord::on_component(
-                            framework.serenity_context,
-                            &framework.user_data.games,
-                            &framework.user_data.prompts,
-                            component,
-                        )
-                        .await?;
+                    if let serenity::FullEvent::InteractionCreate { interaction } = event {
+                        match interaction {
+                            serenity::Interaction::Component(component) => {
+                                game::discord::on_component(
+                                    framework.serenity_context,
+                                    &framework.user_data.games,
+                                    &framework.user_data.prompts,
+                                    component,
+                                )
+                                .await?;
+                            }
+                            serenity::Interaction::Modal(modal) => {
+                                game::discord::on_modal(
+                                    framework.serenity_context,
+                                    &framework.user_data.games,
+                                    modal,
+                                )
+                                .await?;
+                            }
+                            _ => {}
+                        }
                     }
                     Ok(())
                 })
