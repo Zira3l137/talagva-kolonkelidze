@@ -16,7 +16,12 @@ use super::{Category, Kind, draw, random};
 use crate::config::GroqConfig;
 
 const REFILL_BELOW: usize = 3;
+/// How many served prompts are remembered locally to reject duplicates.
 const RECENT_LIMIT: usize = 24;
+/// How many of those are sent to the model as "do not repeat" context. Sending
+/// fewer keeps input tokens down; the larger local history still filters
+/// duplicates, and the refill log reports how many were rejected.
+const HISTORY_SENT: usize = 6;
 const RETRY_DELAY: Duration = Duration::from_secs(90);
 
 #[derive(Default)]
@@ -123,7 +128,7 @@ impl Cache {
             let recent: Vec<String> = {
                 let buckets = self.buckets.lock().await;
                 buckets.get(&(category, kind))
-                    .map(|bucket| bucket.recently_used.iter().cloned().collect())
+                    .map(|bucket| history_for_request(&bucket.recently_used))
                     .unwrap_or_default()
             };
             self.provider.generate(category, kind, &recent).await
@@ -134,6 +139,7 @@ impl Cache {
         bucket.loading = false;
         match result {
             Ok(prompts) => {
+                let generated = prompts.len();
                 let mut added = 0;
                 for prompt in prompts {
                     if bucket.ready.iter().chain(bucket.recently_used.iter())
@@ -143,8 +149,10 @@ impl Cache {
                     bucket.ready.push_back(prompt);
                     added += 1;
                 }
+                let duplicates = generated - added;
                 bucket.retry_at = if added == 0 { Some(Instant::now() + RETRY_DELAY) } else { None };
-                info!(category = category.label(), kind = kind.label(), added, "AI prompt cache refilled");
+                info!(category = category.label(), kind = kind.label(), generated, added, duplicates,
+                    "AI prompt cache refilled");
             }
             Err(error) => {
                 bucket.retry_at = Some(Instant::now() + RETRY_DELAY);
@@ -162,10 +170,16 @@ fn remember(recent: &mut VecDeque<String>, prompt: &str) {
     }
 }
 
+/// The newest `HISTORY_SENT` prompts, oldest first.
+fn history_for_request(recent: &VecDeque<String>) -> Vec<String> {
+    let skip = recent.len().saturating_sub(HISTORY_SENT);
+    recent.iter().skip(skip).cloned().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use super::{RECENT_LIMIT, remember};
+    use super::{HISTORY_SENT, RECENT_LIMIT, history_for_request, remember};
 
     #[tokio::test]
     async fn without_key_uses_curated_prompts() {
@@ -183,5 +197,20 @@ mod tests {
         }
         assert_eq!(queue.len(), RECENT_LIMIT);
         assert_eq!(queue.front().map(String::as_str), Some("9"));
+    }
+
+    #[test]
+    fn request_history_is_the_newest_few_in_order() {
+        let mut queue = VecDeque::new();
+        for index in 0..RECENT_LIMIT {
+            remember(&mut queue, &index.to_string());
+        }
+        let sent = history_for_request(&queue);
+        assert_eq!(sent.len(), HISTORY_SENT);
+        assert_eq!(sent.first().map(String::as_str), Some((RECENT_LIMIT - HISTORY_SENT).to_string().as_str()));
+        assert_eq!(sent.last().map(String::as_str), Some((RECENT_LIMIT - 1).to_string().as_str()));
+        // A short history is sent in full.
+        let short: VecDeque<String> = ["a".to_owned(), "b".to_owned()].into();
+        assert_eq!(history_for_request(&short), ["a", "b"]);
     }
 }
