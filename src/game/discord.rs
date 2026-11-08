@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use poise::serenity_prelude as serenity;
@@ -166,6 +167,79 @@ pub(crate) async fn stop(ctx: CommandContext<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Anyone can retrieve an ephemeral jump link without publishing another
+/// message into an active conversation.
+pub(crate) async fn show(ctx: CommandContext<'_>) -> Result<()> {
+    ctx.defer_ephemeral().await.context("failed to acknowledge /tod show")?;
+    let channel = ctx.channel_id();
+    let Some(session) = ctx.data().games.find(channel).await else {
+        ctx.say("There is no active Truth or Dare game in this channel.")
+            .await.context("failed to report missing game")?;
+        return Ok(());
+    };
+    let game = session.lock().await;
+    if game.is_expired() {
+        ctx.say("The previous game has expired. Use `/tod start` to play again.")
+            .await.context("failed to report expired game")?;
+        return Ok(());
+    }
+    let Some(message_id) = game.message_id else {
+        ctx.say("The game message is still being created. Try again shortly.")
+            .await.context("failed to report initializing game")?;
+        return Ok(());
+    };
+    let guild = ctx.guild_id().context("/tod show requires a server")?;
+    let link = message_link(guild, channel, message_id);
+    drop(game);
+    ctx.say(format!("[Jump to the current Truth or Dare game]({link})"))
+        .await
+        .context("failed to send game message link")?;
+    Ok(())
+}
+
+/// The host can manually re-post the game if conversation hides the message
+/// between turns. This doesn't advance or otherwise modify game state.
+pub(crate) async fn bump(ctx: CommandContext<'_>) -> Result<()> {
+    ctx.defer_ephemeral().await.context("failed to acknowledge /tod bump")?;
+    let channel = ctx.channel_id();
+    let Some(session) = ctx.data().games.find(channel).await else {
+        ctx.say("There is no active Truth or Dare game in this channel.")
+            .await.context("failed to report missing game")?;
+        return Ok(());
+    };
+    let mut game = session.lock().await;
+    if game.host != ctx.author().id {
+        ctx.say("Only the game host can bump it.")
+            .await.context("failed to report missing host permission")?;
+        return Ok(());
+    }
+    if game.is_expired() {
+        ctx.say("The previous game has expired. Use `/tod start` to play again.")
+            .await.context("failed to report expired game")?;
+        return Ok(());
+    }
+    repost(ctx.http(), channel, &mut game).await.context("failed to bump game")?;
+    game.last_activity = Instant::now();
+    let guild = ctx.guild_id().context("/tod bump requires a server")?;
+    let message_id = game.message_id.context("bumped game lacks a message ID")?;
+    info!(%channel, session_id = game.id, user_id = %ctx.author().id,
+        "Truth or Dare game manually bumped");
+    let link = message_link(guild, channel, message_id);
+    drop(game);
+    ctx.say(format!("Game moved: [jump to the latest message]({link})."))
+        .await
+        .context("failed to acknowledge bumped game")?;
+    Ok(())
+}
+
+fn message_link(
+    guild: serenity::GuildId,
+    channel: serenity::ChannelId,
+    message: serenity::MessageId,
+) -> String {
+    format!("https://discord.com/channels/{}/{}/{}", guild.get(), channel.get(), message.get())
+}
+
 /// Only callbacks with a game-specific custom ID are handled here; Poise owns
 /// application slash command interactions separately.
 pub(crate) async fn on_component(
@@ -184,7 +258,12 @@ pub(crate) async fn on_component(
 
     let mut game = session.lock().await;
     if game.id != session_id || game.message_id != Some(component.message.id) {
-        return private_reply(ctx, component, "This button belongs to an older game.").await;
+        return private_reply(
+            ctx,
+            component,
+            "This button belongs to an older game. Use `/tod show` to find the current one.",
+        )
+        .await;
     }
     if game.is_expired() {
         let response = CreateInteractionResponseMessage::new()
@@ -219,17 +298,42 @@ pub(crate) async fn on_component(
         Ok(result) => result,
         Err(message) => return private_reply(ctx, component, message).await,
     };
-    let response = match result {
-        Transition::Updated => View::from_game(&updated).into_response(),
-        Transition::Ended => CreateInteractionResponseMessage::new()
-            .content(finished_message("ended by the host"))
-            .components(Vec::new())
-            .allowed_mentions(no_pings()),
-    };
-    component
-        .create_response(ctx, CreateInteractionResponse::UpdateMessage(response))
-        .await
-        .context("failed to update Truth or Dare game message")?;
+    if result == Transition::Updated && should_repost(action) {
+        // Updating a Discord message does not move it to the latest position.
+        // Acknowledge the button before performing two separate HTTP requests.
+        component
+            .create_response(ctx, CreateInteractionResponse::Acknowledge)
+            .await
+            .context("failed to acknowledge game action")?;
+
+        if let Err(error) = repost(ctx.http.as_ref(), channel, &mut updated).await {
+            warn!(%channel, session_id, error = ?error,
+                "could not move game to the bottom; updating existing message instead");
+            // If the new message failed to send, keep the existing game usable.
+            // State is only committed after the fallback edit succeeds.
+            channel
+                .edit_message(
+                    ctx,
+                    component.message.id,
+                    View::from_game(&updated).into_edit_message(),
+                )
+                .await
+                .context("failed to update game after repost failure")?;
+        }
+    } else {
+        // Lobby membership and game termination edit in place, avoiding noise.
+        let response = match result {
+            Transition::Updated => View::from_game(&updated).into_response(),
+            Transition::Ended => CreateInteractionResponseMessage::new()
+                .content(finished_message("ended by the host"))
+                .components(Vec::new())
+                .allowed_mentions(no_pings()),
+        };
+        component
+            .create_response(ctx, CreateInteractionResponse::UpdateMessage(response))
+            .await
+            .context("failed to update Truth or Dare game message")?;
+    }
     *game = updated;
 
     debug!(
@@ -242,6 +346,59 @@ pub(crate) async fn on_component(
         games.remove_if_current(channel, &session).await;
     }
     Ok(())
+}
+
+/// Repost only when the game progresses. Reposting every lobby join or leave
+/// would generate unnecessary Discord traffic.
+fn should_repost(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Begin | Action::Truth | Action::Dare | Action::Complete | Action::Skip
+    )
+}
+
+/// Post the new state before removing the old message, so a failed send never
+/// makes the live game disappear. The per-session lock protects this sequence
+/// from simultaneous button presses and /tod bump calls.
+async fn repost(
+    http: &serenity::Http,
+    channel: serenity::ChannelId,
+    game: &mut Game,
+) -> Result<()> {
+    let previous = game.message_id.context("the game message is not initialized")?;
+    let posted = channel
+        .send_message(http, View::from_game(game).into_create_message())
+        .await
+        .context("failed to post game at the bottom of the channel")?;
+    game.message_id = Some(posted.id);
+    retire_previous(http, channel, previous, posted.id).await;
+    debug!(%channel, old_message = %previous, new_message = %posted.id,
+        "Truth or Dare message moved to the bottom");
+    Ok(())
+}
+
+async fn retire_previous(
+    http: &serenity::Http,
+    channel: serenity::ChannelId,
+    previous: serenity::MessageId,
+    replacement: serenity::MessageId,
+) {
+    if let Err(error) = channel.delete_message(http, previous).await {
+        warn!(%channel, %previous, error = ?error,
+            "could not delete previous game message; disabling old buttons");
+        // An old copy must never present apparently functional buttons. If
+        // deletion fails, leave a pointer to the current message instead.
+        let edit = EditMessage::new()
+            .content(format!(
+                "**Truth or Dare** has moved to message {replacement}. Use `/tod show` to jump to it."
+            ))
+            .components(Vec::new())
+            .allowed_mentions(no_pings());
+        if let Err(error) = channel.edit_message(http, previous, edit).await {
+            warn!(%channel, %previous, error = ?error,
+                "could not disable buttons on previous game message");
+        }
+    }
 }
 
 async fn private_reply(
@@ -354,10 +511,41 @@ impl View {
             .allowed_mentions(no_pings())
     }
 
+    fn into_edit_message(self) -> EditMessage {
+        EditMessage::new()
+            .content(self.content)
+            .components(self.components)
+            .allowed_mentions(no_pings())
+    }
+
     fn into_response(self) -> CreateInteractionResponseMessage {
         CreateInteractionResponseMessage::new()
             .content(self.content)
             .components(self.components)
             .allowed_mentions(no_pings())
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::{Action, message_link, should_repost};
+    use poise::serenity_prelude::{ChannelId, GuildId, MessageId};
+
+    #[test]
+    fn advances_are_reposted_but_lobby_edits_and_stop_are_not() {
+        for action in [Action::Begin, Action::Truth, Action::Dare, Action::Complete, Action::Skip] {
+            assert!(should_repost(action), "{action:?} should reposition the game");
+        }
+        for action in [Action::Join, Action::Leave, Action::Stop] {
+            assert!(!should_repost(action), "{action:?} should edit in place");
+        }
+    }
+
+    #[test]
+    fn link_uses_discord_message_url_format() {
+        assert_eq!(
+            message_link(GuildId::new(1), ChannelId::new(2), MessageId::new(3)),
+            "https://discord.com/channels/1/2/3"
+        );
     }
 }
