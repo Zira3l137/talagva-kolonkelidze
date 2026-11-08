@@ -161,7 +161,11 @@ impl Game {
                 if self.phase != Phase::Choosing {
                     return Err("It's not time to choose Truth or Dare.");
                 }
-                let kind = if action == A::Truth { Kind::Truth } else { Kind::Dare };
+                let kind = if action == A::Truth {
+                    Kind::Truth
+                } else {
+                    Kind::Dare
+                };
                 let prompt = draw(self.category, kind, self.last_prompt);
                 self.last_prompt = Some(prompt);
                 self.phase = Phase::Challenge { kind, prompt };
@@ -215,8 +219,16 @@ mod tests {
 
     #[test]
     fn ids_are_strict_and_versioned() {
-        for action in [Action::Join, Action::Leave, Action::Begin, Action::Truth, Action::Dare,
-                       Action::Complete, Action::Skip, Action::Stop] {
+        for action in [
+            Action::Join,
+            Action::Leave,
+            Action::Begin,
+            Action::Truth,
+            Action::Dare,
+            Action::Complete,
+            Action::Skip,
+            Action::Stop,
+        ] {
             assert_eq!(Action::parse(&action.id(42)), Some((42, action)));
         }
         assert_eq!(Action::parse("tod:42:unknown"), None);
@@ -227,7 +239,10 @@ mod tests {
     #[test]
     fn lobby_permissions_and_limits() {
         let mut game = Game::new(1, user(1), Category::Casual);
-        assert_eq!(game.apply(user(1), Action::Begin), Err("At least two players must join before starting."));
+        assert_eq!(
+            game.apply(user(1), Action::Begin),
+            Err("At least two players must join before starting.")
+        );
         assert!(game.apply(user(2), Action::Join).is_ok());
         assert!(game.apply(user(2), Action::Join).is_err());
         assert!(game.apply(user(2), Action::Begin).is_err());
@@ -245,10 +260,20 @@ mod tests {
         game.apply(user(2), Action::Join).unwrap();
         game.apply(user(1), Action::Begin).unwrap();
         let current = game.current_player().unwrap();
-        let other = if current == user(1) { user(2) } else { user(1) };
+        let other = if current == user(1) {
+            user(2)
+        } else {
+            user(1)
+        };
         assert!(game.apply(other, Action::Truth).is_err());
         assert!(game.apply(current, Action::Truth).is_ok());
-        assert!(matches!(game.phase, Phase::Challenge { kind: Kind::Truth, .. }));
+        assert!(matches!(
+            game.phase,
+            Phase::Challenge {
+                kind: Kind::Truth,
+                ..
+            }
+        ));
         assert!(game.apply(other, Action::Complete).is_err());
         assert!(game.apply(current, Action::Complete).is_ok());
         assert_eq!(game.round, 2);

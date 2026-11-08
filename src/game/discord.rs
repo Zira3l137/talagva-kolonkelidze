@@ -13,9 +13,9 @@ use serenity::builder::{
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::CommandContext;
-use super::{Action, Category, Game, Kind, Phase, Transition, draw};
 use super::state::MAX_PLAYERS;
+use super::{Action, Category, Game, Kind, Phase, Transition, draw};
+use crate::CommandContext;
 
 type SharedGame = Arc<Mutex<Game>>;
 
@@ -43,7 +43,9 @@ impl Games {
 /// Create a lobby, remembering the message ID so stale buttons can never
 /// manipulate a later game in the same channel.
 pub(crate) async fn create_lobby(ctx: CommandContext<'_>, category: Category) -> Result<()> {
-    ctx.defer_ephemeral().await.context("failed to acknowledge /tod start")?;
+    ctx.defer_ephemeral()
+        .await
+        .context("failed to acknowledge /tod start")?;
 
     let channel = ctx.channel_id();
     let actor = ctx.author().id;
@@ -53,11 +55,11 @@ pub(crate) async fn create_lobby(ctx: CommandContext<'_>, category: Category) ->
         let old = previous.lock().await;
         if old.is_expired() {
             if let Some(message_id) = old.message_id {
-                if let Err(error) = channel.edit_message(ctx.http(), message_id,
-                    EditMessage::new()
-                        .content(finished_message("timed out after two hours of inactivity"))
-                        .components(Vec::new()).allowed_mentions(no_pings())).await
-                {
+                let edit = EditMessage::new()
+                    .content(finished_message("timed out after two hours of inactivity"))
+                    .components(Vec::new())
+                    .allowed_mentions(no_pings());
+                if let Err(error) = channel.edit_message(ctx.http(), message_id, edit).await {
                     warn!(%channel, error = ?error, "could not disable buttons on expired lobby");
                 }
             }
@@ -73,7 +75,8 @@ pub(crate) async fn create_lobby(ctx: CommandContext<'_>, category: Category) ->
         if sessions.contains_key(&channel) {
             drop(sessions);
             ctx.say("A Truth or Dare game already exists here. End it before creating another.")
-                .await.context("failed to report existing game")?;
+                .await
+                .context("failed to report existing game")?;
             return Ok(());
         }
         sessions.insert(channel, Arc::clone(&session));
@@ -81,7 +84,9 @@ pub(crate) async fn create_lobby(ctx: CommandContext<'_>, category: Category) ->
 
     let mut game = session.lock().await;
     let view = View::from_game(&game);
-    let send = channel.send_message(ctx.http(), view.into_create_message()).await;
+    let send = channel
+        .send_message(ctx.http(), view.into_create_message())
+        .await;
     let message = match send {
         Ok(message) => message,
         Err(error) => {
@@ -92,48 +97,72 @@ pub(crate) async fn create_lobby(ctx: CommandContext<'_>, category: Category) ->
     };
     game.message_id = Some(message.id);
     drop(game);
-    info!(%channel, %actor, session_id = id, category = category.label(), "Truth or Dare lobby created");
+    info!(
+        %channel, %actor, session_id = id, category = category.label(),
+        "Truth or Dare lobby created"
+    );
     ctx.say("Lobby created. Other players can now use **Join** in the game message.")
-        .await.context("failed to acknowledge created lobby")?;
+        .await
+        .context("failed to acknowledge created lobby")?;
     Ok(())
 }
 
 /// A standalone prompt requires no lobby and doesn't mutate party game state.
 pub(crate) async fn quick(ctx: CommandContext<'_>, kind: Kind, category: Category) -> Result<()> {
     let prompt = draw(category, kind, None);
-    ctx.say(format!("**{} · {}**\n\n{prompt}\n\nYou can always skip a prompt you're uncomfortable with.",
-        kind.label(), category.label()))
-        .await.context("failed to send quick prompt")?;
-    info!(user_id = %ctx.author().id, category = category.label(), kind = kind.label(), "quick prompt served");
+    ctx.say(format!(
+        "**{} · {}**\n\n{prompt}\n\nYou can always skip a prompt you're uncomfortable with.",
+        kind.label(),
+        category.label()
+    ))
+    .await
+    .context("failed to send quick prompt")?;
+    info!(
+        user_id = %ctx.author().id,
+        category = category.label(),
+        kind = kind.label(),
+        "quick prompt served"
+    );
     Ok(())
 }
 
 /// Host-only slash-command fallback when the message scrolls out of view.
 pub(crate) async fn stop(ctx: CommandContext<'_>) -> Result<()> {
-    ctx.defer_ephemeral().await.context("failed to acknowledge /tod stop")?;
+    ctx.defer_ephemeral()
+        .await
+        .context("failed to acknowledge /tod stop")?;
     let channel = ctx.channel_id();
     let games = &ctx.data().games;
     let Some(session) = games.find(channel).await else {
         ctx.say("There is no active Truth or Dare game in this channel.")
-            .await.context("failed to report missing game")?;
+            .await
+            .context("failed to report missing game")?;
         return Ok(());
     };
     let game = session.lock().await;
     if ctx.author().id != game.host {
         ctx.say("Only the game host can end it.")
-            .await.context("failed to report missing host permission")?;
+            .await
+            .context("failed to report missing host permission")?;
         return Ok(());
     }
-    let message_id = game.message_id.context("the game lobby has not finished initializing")?;
-    channel.edit_message(ctx.http(), message_id, EditMessage::new()
+    let message_id = game
+        .message_id
+        .context("the game lobby has not finished initializing")?;
+    let edit = EditMessage::new()
         .content(finished_message("ended by the host"))
         .components(Vec::new())
-        .allowed_mentions(no_pings()))
-        .await.context("failed to close game message")?;
+        .allowed_mentions(no_pings());
+    channel
+        .edit_message(ctx.http(), message_id, edit)
+        .await
+        .context("failed to close game message")?;
     info!(%channel, session_id = game.id, "Truth or Dare game ended by slash command");
     drop(game);
     games.remove_if_current(channel, &session).await;
-    ctx.say("Truth or Dare game ended.").await.context("failed to acknowledge end")?;
+    ctx.say("Truth or Dare game ended.")
+        .await
+        .context("failed to acknowledge end")?;
     Ok(())
 }
 
@@ -157,11 +186,14 @@ pub(crate) async fn on_component(
         return private_reply(ctx, component, "This button belongs to an older game.").await;
     }
     if game.is_expired() {
-        component.create_response(ctx, CreateInteractionResponse::UpdateMessage(
-            CreateInteractionResponseMessage::new()
-                .content(finished_message("timed out after two hours of inactivity"))
-                .components(Vec::new()).allowed_mentions(no_pings())))
-            .await.context("failed to close expired game")?;
+        let response = CreateInteractionResponseMessage::new()
+            .content(finished_message("timed out after two hours of inactivity"))
+            .components(Vec::new())
+            .allowed_mentions(no_pings());
+        component
+            .create_response(ctx, CreateInteractionResponse::UpdateMessage(response))
+            .await
+            .context("failed to close expired game")?;
         info!(%channel, session_id, "Truth or Dare game expired");
         drop(game);
         games.remove_if_current(channel, &session).await;
@@ -179,13 +211,19 @@ pub(crate) async fn on_component(
         Transition::Updated => View::from_game(&updated).into_response(),
         Transition::Ended => CreateInteractionResponseMessage::new()
             .content(finished_message("ended by the host"))
-            .components(Vec::new()).allowed_mentions(no_pings()),
+            .components(Vec::new())
+            .allowed_mentions(no_pings()),
     };
-    component.create_response(ctx, CreateInteractionResponse::UpdateMessage(response))
-        .await.context("failed to update Truth or Dare game message")?;
+    component
+        .create_response(ctx, CreateInteractionResponse::UpdateMessage(response))
+        .await
+        .context("failed to update Truth or Dare game message")?;
     *game = updated;
 
-    debug!(%channel, session_id, user_id = %component.user.id, ?action, ?result, "game action accepted");
+    debug!(
+        %channel, session_id, user_id = %component.user.id, ?action, ?result,
+        "game action accepted"
+    );
     if result == Transition::Ended {
         info!(%channel, session_id, "Truth or Dare game ended");
         drop(game);
@@ -199,13 +237,20 @@ async fn private_reply(
     component: &serenity::ComponentInteraction,
     message: &str,
 ) -> Result<()> {
-    component.create_response(ctx, CreateInteractionResponse::Message(
-        CreateInteractionResponseMessage::new().content(message).ephemeral(true)))
-        .await.context("failed to send ephemeral game response")
+    let reply = CreateInteractionResponseMessage::new()
+        .content(message)
+        .ephemeral(true);
+    component
+        .create_response(ctx, CreateInteractionResponse::Message(reply))
+        .await
+        .context("failed to send ephemeral game response")
 }
 
 fn no_pings() -> CreateAllowedMentions {
-    CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false)
+    CreateAllowedMentions::new()
+        .all_users(false)
+        .all_roles(false)
+        .everyone(false)
 }
 
 fn finished_message(reason: &str) -> String {
@@ -221,7 +266,10 @@ impl View {
     fn from_game(game: &Game) -> Self {
         let mut content = format!(
             "**Truth or Dare · {}**\nHost: <@{}> · Players: {}/{}\n",
-            game.category.label(), game.host.get(), game.players.len(), MAX_PLAYERS,
+            game.category.label(),
+            game.host.get(),
+            game.players.len(),
+            MAX_PLAYERS,
         );
         let actions = match game.phase {
             Phase::Lobby => {
@@ -230,44 +278,74 @@ impl View {
                     content.push_str(&format!("• <@{}>\n", player.get()));
                 }
                 content.push_str("\nHost: press **Start** when at least two people have joined.");
-                vec![(Action::Join, "Join"), (Action::Leave, "Leave"),
-                     (Action::Begin, "Start"), (Action::Stop, "End Game")]
+                vec![
+                    (Action::Join, "Join"),
+                    (Action::Leave, "Leave"),
+                    (Action::Begin, "Start"),
+                    (Action::Stop, "End Game"),
+                ]
             }
             Phase::Choosing => {
                 content.push_str(&format!(
                     "\n**Round {}** · <@{}>'s turn.\nChoose **Truth** or **Dare**.\n",
-                    game.round, game.current_player().expect("active game needs a current player").get(),
+                    game.round,
+                    game.current_player().expect("active game needs a current player").get(),
                 ));
-                vec![(Action::Truth, "Truth"), (Action::Dare, "Dare"),
-                     (Action::Skip, "Skip Turn"), (Action::Stop, "End Game")]
+                vec![
+                    (Action::Truth, "Truth"),
+                    (Action::Dare, "Dare"),
+                    (Action::Skip, "Skip Turn"),
+                    (Action::Stop, "End Game"),
+                ]
             }
             Phase::Challenge { kind, prompt } => {
                 content.push_str(&format!(
                     "\n**Round {}** · <@{}>'s turn.\n**{}:** {prompt}\n\n",
-                    game.round, game.current_player().expect("active game needs a current player").get(), kind.label(),
+                    game.round,
+                    game.current_player().expect("active game needs a current player").get(), kind.label(),
                 ));
-                content.push_str("Complete your prompt or skip it. The host can skip an inactive player's turn.");
-                vec![(Action::Complete, "Completed"), (Action::Skip, "Skip Turn"),
-                     (Action::Stop, "End Game")]
+                content.push_str(
+                    "Complete your prompt or skip it. The host can skip an inactive player's turn.",
+                );
+                vec![
+                    (Action::Complete, "Completed"),
+                    (Action::Skip, "Skip Turn"),
+                    (Action::Stop, "End Game"),
+                ]
             }
         };
-        let buttons = actions.into_iter().map(|(action, label)| {
-            let style = match action {
-                Action::Stop => serenity::ButtonStyle::Danger,
-                Action::Begin | Action::Truth | Action::Dare | Action::Complete => serenity::ButtonStyle::Primary,
-                _ => serenity::ButtonStyle::Secondary,
-            };
-            CreateButton::new(action.id(game.id)).label(label).style(style)
-        }).collect();
-        Self { content, components: vec![CreateActionRow::Buttons(buttons)] }
+        let buttons = actions
+            .into_iter()
+            .map(|(action, label)| {
+                let style = match action {
+                    Action::Stop => serenity::ButtonStyle::Danger,
+                    Action::Begin | Action::Truth | Action::Dare | Action::Complete => {
+                        serenity::ButtonStyle::Primary
+                    }
+                    _ => serenity::ButtonStyle::Secondary,
+                };
+                CreateButton::new(action.id(game.id))
+                    .label(label)
+                    .style(style)
+            })
+            .collect();
+        Self {
+            content,
+            components: vec![CreateActionRow::Buttons(buttons)],
+        }
     }
 
     fn into_create_message(self) -> CreateMessage {
-        CreateMessage::new().content(self.content).components(self.components).allowed_mentions(no_pings())
+        CreateMessage::new()
+            .content(self.content)
+            .components(self.components)
+            .allowed_mentions(no_pings())
     }
 
     fn into_response(self) -> CreateInteractionResponseMessage {
         CreateInteractionResponseMessage::new()
-            .content(self.content).components(self.components).allowed_mentions(no_pings())
+            .content(self.content)
+            .components(self.components)
+            .allowed_mentions(no_pings())
     }
 }
