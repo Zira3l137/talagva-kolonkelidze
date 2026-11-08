@@ -2,12 +2,17 @@
 
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow, bail};
-use reqwest::{Client, StatusCode};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use reqwest::Client;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{Category, Kind};
+use super::Category;
+use super::Kind;
 use crate::config::GroqConfig;
 
 const URL: &str = "https://api.groq.com/openai/v1/chat/completions";
@@ -46,12 +51,7 @@ impl Groq {
             .timeout(Duration::from_secs(20))
             .build()
             .context("failed to configure Groq HTTP client")?;
-        Ok(Self {
-            http,
-            key: config.key,
-            model: config.model,
-            language: config.language,
-        })
+        Ok(Self { http, key: config.key, model: config.model, language: config.language })
     }
 
     pub async fn generate(
@@ -60,11 +60,18 @@ impl Groq {
         kind: Kind,
         recent: &[String],
     ) -> Result<Vec<String>> {
-        let language = if self.language == "ka" { "Georgian (ქართული)" } else { "English" };
+        let language =
+            if self.language == "ka" { "Georgian (ქართული)" } else { "English" };
         let category_instruction = match category {
-            Category::Casual => "Lighthearted, funny, playful; suitable for strangers.",
-            Category::Personal => "Thoughtful and personal but not invasive or distressing.",
-            Category::Romantic => "Light flirtation and fictional romance, not explicit or pressuring.",
+            Category::Casual => {
+                "Playful chaos, ridiculous opinions, social mishaps, and low-stakes embarrassment."
+            }
+            Category::Personal => {
+                "Revealing stories, contradictions, questionable taste, and harmless confessions; curious, not therapeutic."
+            }
+            Category::Romantic => {
+                "Crushes, flirting, romantic tension, dating mishaps, and cheesy charm; cheeky and non-explicit, without pressuring anyone to name or involve another player."
+            }
         };
         let kind_instruction = match kind {
             Kind::Truth => "Write a single direct question for each item.",
@@ -72,11 +79,21 @@ impl Groq {
         };
         let instructions = format!(
             "Generate {BATCH_SIZE} distinct {kind} prompts in {language} for a public Discord Truth or Dare game. \
-             Category: {category}. {category_instruction} {kind_instruction} \
-             All prompts must be self-contained, concise, original, suitable for a mixed-age general server, \
-             and require no private information, external contact, touching, payments, dangerous activity, \
-             harassment, humiliation, or sexual content. No real player names, mentions, URLs, or instructions \
-             to change accounts. Participation must remain optional. Only return the requested JSON.",
+            Category: {category}. {category_instruction} {kind_instruction} \
+            Aim for the energy of a witty, mischievous friend: bold, funny, surprising, and occasionally revealing. \
+            Harmless embarrassment, mild flirting, playful teasing, petty opinions, and awkward confessions are welcome. \
+            Truths should invite a specific story, an unexpected admission, or a genuinely difficult choice. \
+            Dares should create an entertaining moment through text or voice: a performance, improvisation, \
+            absurd argument, or creative challenge. Make them immediately doable with no purchases or preparation. \
+            Avoid generic icebreakers, repetitive 'favorite X' questions, therapy-speak, motivational exercises, \
+            and recycled party-game clichés. Give each prompt one memorable twist without making it convoluted. \
+            Vary the topics and formats; don't produce several versions of the same idea. \
+            Use natural, conversational {language}, including idiomatic humor rather than literal translations. \
+            Each prompt must be self-contained, one line, and 12–250 characters. \
+            Keep it appropriate for a mixed-age group: non-explicit, physically safe, and voluntary. \
+            Don't demand identifying information, expose someone else's secrets, or pressure anyone into \
+            unwanted contact, cruelty, or participation. No mentions, URLs, or account changes. \
+            Don't append disclaimers or reminders to individual prompts. Return only the requested JSON.",
             category = category.label(),
             kind = kind.label(),
         );
@@ -109,7 +126,9 @@ impl Groq {
             }
         });
 
-        let response = self.http.post(URL)
+        let response = self
+            .http
+            .post(URL)
             .bearer_auth(&self.key)
             .json(&request)
             .send()
@@ -118,15 +137,22 @@ impl Groq {
 
         match response.status() {
             StatusCode::OK => {}
-            StatusCode::TOO_MANY_REQUESTS => bail!("Groq request quota or rate limit reached (HTTP 429)"),
+            StatusCode::TOO_MANY_REQUESTS => {
+                bail!("Groq request quota or rate limit reached (HTTP 429)")
+            }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                bail!("Groq rejected the API credentials or model permissions (HTTP {})", response.status());
+                bail!(
+                    "Groq rejected the API credentials or model permissions (HTTP {})",
+                    response.status()
+                );
             }
             status => bail!("Groq returned HTTP {status}"),
         }
 
         let body: Completion = response.json().await.context("failed to decode Groq response")?;
-        let content = body.choices.first()
+        let content = body
+            .choices
+            .first()
             .and_then(|choice| choice.message.content.as_deref())
             .ok_or_else(|| anyhow!("Groq returned no message content"))?;
         parse_batch(content)
@@ -145,7 +171,9 @@ fn parse_batch(content: &str) -> Result<Vec<String>> {
         if !prompts.iter().any(|existing: &String| existing.eq_ignore_ascii_case(prompt)) {
             prompts.push(prompt.to_owned());
         }
-        if prompts.len() == BATCH_SIZE { break; }
+        if prompts.len() == BATCH_SIZE {
+            break;
+        }
     }
     if prompts.is_empty() {
         bail!("Groq returned no usable prompts");
@@ -168,7 +196,8 @@ fn is_usable(prompt: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_usable, parse_batch};
+    use super::is_usable;
+    use super::parse_batch;
 
     #[test]
     fn removes_invalid_and_repeated_prompts() {
