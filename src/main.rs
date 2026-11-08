@@ -1,6 +1,7 @@
 mod bot;
 mod commands;
 mod config;
+mod game;
 mod logging;
 
 use anyhow::{Context as _, Result};
@@ -12,6 +13,7 @@ pub(crate) type CommandContext<'a> = poise::Context<'a, Data, Error>;
 
 pub(crate) struct Data {
     quotes_channel: ChannelId,
+    games: game::discord::Games,
 }
 
 #[tokio::main]

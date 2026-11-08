@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result};
 use poise::serenity_prelude as serenity;
 use tracing::{error, info};
 
-use crate::{Data, Error, commands, config::Config};
+use crate::{Data, Error, commands, config::Config, game};
 
 pub(crate) async fn run(config: Config) -> Result<()> {
     let intents =
@@ -11,7 +11,14 @@ pub(crate) async fn run(config: Config) -> Result<()> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![commands::enquote()],
+            commands: vec![commands::enquote(), commands::tod()],
+            event_handler: |framework, event| Box::pin(async move {
+                if let serenity::FullEvent::InteractionCreate { interaction: serenity::Interaction::Component(component) } = event {
+                    game::discord::on_component(framework.serenity_context, &framework.user_data.games, component)
+                        .await?;
+                }
+                Ok(())
+            }),
             on_error: |error| Box::pin(handle_error(error)),
             // Preserve the old text prefix; this is not an application slash command.
             prefix_options: poise::PrefixFrameworkOptions {
@@ -20,10 +27,12 @@ pub(crate) async fn run(config: Config) -> Result<()> {
             },
             ..Default::default()
         })
-        .setup(move |_, ready, _| {
+        .setup(move |ctx, ready, framework| {
             Box::pin(async move {
                 info!(user = %ready.user.name, user_id = %ready.user.id, "connected to Discord");
-                Ok(Data { quotes_channel })
+                poise::builtins::register_globally(ctx, &framework.options().commands)
+                    .await.context("failed to register Discord slash commands")?;
+                Ok(Data { quotes_channel, games: game::discord::Games::default() })
             })
         })
         .build();
