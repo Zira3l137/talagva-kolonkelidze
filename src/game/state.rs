@@ -55,11 +55,11 @@ impl Action {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     Lobby,
     Choosing,
-    Challenge { kind: Kind, prompt: &'static str },
+    Challenge { kind: Kind, prompt: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +79,7 @@ pub(crate) struct Game {
     pub round: u32,
     pub last_activity: Instant,
     current: usize,
-    last_prompt: Option<&'static str>,
+    last_prompt: Option<String>,
 }
 
 impl Game {
@@ -99,14 +99,29 @@ impl Game {
     }
 
     pub fn current_player(&self) -> Option<UserId> {
-        (!matches!(self.phase, Phase::Lobby)).then(|| self.players[self.current])
+        (!matches!(&self.phase, Phase::Lobby)).then(|| self.players[self.current])
     }
 
     pub fn is_expired(&self) -> bool {
         self.last_activity.elapsed() >= IDLE_TIMEOUT
     }
 
+    pub fn last_prompt(&self) -> Option<&str> {
+        self.last_prompt.as_deref()
+    }
+
+    #[cfg(test)]
     pub fn apply(&mut self, actor: UserId, action: Action) -> Result<Transition, &'static str> {
+        self.apply_with_prompt(actor, action, None)
+    }
+
+    /// An externally generated prompt is only consumed after the turn is validated.
+    pub fn apply_with_prompt(
+        &mut self,
+        actor: UserId,
+        action: Action,
+        supplied_prompt: Option<String>,
+    ) -> Result<Transition, &'static str> {
         use Action as A;
         let outcome = match action {
             A::Stop => {
@@ -166,14 +181,16 @@ impl Game {
                 } else {
                     Kind::Dare
                 };
-                let prompt = draw(self.category, kind, self.last_prompt);
-                self.last_prompt = Some(prompt);
+                let prompt = supplied_prompt.unwrap_or_else(|| {
+                    draw(self.category, kind, self.last_prompt.as_deref()).to_owned()
+                });
+                self.last_prompt = Some(prompt.clone());
                 self.phase = Phase::Challenge { kind, prompt };
                 Transition::Updated
             }
             A::Complete => {
                 self.require_turn(actor)?;
-                if !matches!(self.phase, Phase::Challenge { .. }) {
+                if !matches!(&self.phase, Phase::Challenge { .. }) {
                     return Err("There isn't a challenge to complete yet.");
                 }
                 self.advance();
@@ -268,7 +285,7 @@ mod tests {
         assert!(game.apply(other, Action::Truth).is_err());
         assert!(game.apply(current, Action::Truth).is_ok());
         assert!(matches!(
-            game.phase,
+            &game.phase,
             Phase::Challenge {
                 kind: Kind::Truth,
                 ..
@@ -307,5 +324,35 @@ mod tests {
         assert!(game.apply(user(1), Action::Skip).is_ok());
         assert!(game.apply(user(2), Action::Stop).is_err());
         assert_eq!(game.apply(user(1), Action::Stop), Ok(Transition::Ended));
+    }
+}
+
+#[cfg(test)]
+mod ai_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn supplied_prompt_is_used_and_kept_across_turns() {
+        let mut game = Game::new(77, UserId::new(1), Category::Personal);
+        game.apply(UserId::new(2), Action::Join).unwrap();
+        game.apply(UserId::new(1), Action::Begin).unwrap();
+        let actor = game.current_player().unwrap();
+        let text = "დაასახელე შენი საყვარელი ფილმი.";
+        game.apply_with_prompt(actor, Action::Truth, Some(text.to_owned())).unwrap();
+        assert_eq!(game.last_prompt(), Some(text));
+        assert_eq!(game.phase, Phase::Challenge { kind: Kind::Truth, prompt: text.to_owned() });
+        game.apply(actor, Action::Complete).unwrap();
+        assert_eq!(game.last_prompt(), Some(text));
+    }
+
+    #[test]
+    fn illegal_player_cannot_install_a_generated_prompt() {
+        let mut game = Game::new(78, UserId::new(1), Category::Personal);
+        game.apply(UserId::new(2), Action::Join).unwrap();
+        game.apply(UserId::new(1), Action::Begin).unwrap();
+        let actor = if game.current_player() == Some(UserId::new(1)) { UserId::new(2) } else { UserId::new(1) };
+        assert!(game.apply_with_prompt(actor, Action::Truth, Some("invalid prompt".to_owned())).is_err());
+        assert_eq!(game.last_prompt(), None);
+        assert_eq!(game.phase, Phase::Choosing);
     }
 }

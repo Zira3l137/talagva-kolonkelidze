@@ -14,6 +14,7 @@ pub(crate) type CommandContext<'a> = poise::Context<'a, Data, Error>;
 pub(crate) struct Data {
     quotes_channel: ChannelId,
     games: game::discord::Games,
+    prompts: game::PromptService,
 }
 
 #[tokio::main]

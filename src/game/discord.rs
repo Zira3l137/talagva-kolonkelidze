@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::state::MAX_PLAYERS;
-use super::{Action, Category, Game, Kind, Phase, Transition, draw};
+use super::{Action, Category, Game, Kind, Phase, PromptService, Transition};
 use crate::CommandContext;
 
 type SharedGame = Arc<Mutex<Game>>;
@@ -109,7 +109,7 @@ pub(crate) async fn create_lobby(ctx: CommandContext<'_>, category: Category) ->
 
 /// A standalone prompt requires no lobby and doesn't mutate party game state.
 pub(crate) async fn quick(ctx: CommandContext<'_>, kind: Kind, category: Category) -> Result<()> {
-    let prompt = draw(category, kind, None);
+    let prompt = ctx.data().prompts.draw(category, kind, None).await;
     ctx.say(format!(
         "**{} · {}**\n\n{prompt}\n\nYou can always skip a prompt you're uncomfortable with.",
         kind.label(),
@@ -171,6 +171,7 @@ pub(crate) async fn stop(ctx: CommandContext<'_>) -> Result<()> {
 pub(crate) async fn on_component(
     ctx: &serenity::Context,
     games: &Games,
+    prompts: &PromptService,
     component: &serenity::ComponentInteraction,
 ) -> Result<()> {
     let Some((session_id, action)) = Action::parse(&component.data.custom_id) else {
@@ -203,7 +204,18 @@ pub(crate) async fn on_component(
     // Stage changes on a copy. If Discord rejects the update, the actual
     // game stays on the old turn and the player can retry safely.
     let mut updated = game.clone();
-    let result = match updated.apply(component.user.id, action) {
+    // The cache lookup has no network I/O: the 3-second Discord interaction
+    // deadline is not held hostage by generation or Groq rate limits.
+    let generated = match action {
+        Action::Truth | Action::Dare
+            if game.phase == Phase::Choosing
+                && game.current_player() == Some(component.user.id) => {
+            let kind = if action == Action::Truth { Kind::Truth } else { Kind::Dare };
+            Some(prompts.draw(game.category, kind, game.last_prompt()).await)
+        }
+        _ => None,
+    };
+    let result = match updated.apply_with_prompt(component.user.id, action, generated) {
         Ok(result) => result,
         Err(message) => return private_reply(ctx, component, message).await,
     };
@@ -271,7 +283,7 @@ impl View {
             game.players.len(),
             MAX_PLAYERS,
         );
-        let actions = match game.phase {
+        let actions = match &game.phase {
             Phase::Lobby => {
                 content.push_str("\n**Lobby open** — join below!\n");
                 for player in &game.players {

@@ -2,7 +2,7 @@ use super::random;
 
 /// All categories are suitable for general-purpose servers. Romantic is flirtatious,
 /// but contains no explicit sexual material. Players always have the option to skip.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, poise::ChoiceParameter)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, poise::ChoiceParameter)]
 pub(crate) enum Category {
     #[name = "Casual"]
     Casual,
@@ -22,7 +22,7 @@ impl Category {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, poise::ChoiceParameter)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, poise::ChoiceParameter)]
 pub(crate) enum Kind {
     #[name = "Truth"]
     Truth,
