@@ -7,6 +7,13 @@ use poise::serenity_prelude::ChannelId;
 pub(crate) struct Config {
     pub token: String,
     pub quotes_channel: ChannelId,
+    pub groq: Option<GroqConfig>,
+}
+
+pub(crate) struct GroqConfig {
+    pub key: String,
+    pub model: String,
+    pub language: String,
 }
 
 /// The .env file is optional when a host sets variables itself (e.g. Termux).
@@ -24,7 +31,21 @@ impl Config {
         ensure!(!token.trim().is_empty(), "DISCORD_TOKEN cannot be empty");
         let channel = env::var("TARGET_CHANNEL_ID").context("TARGET_CHANNEL_ID is not set")?;
         let quotes_channel = parse_channel_id(&channel)?;
-        Ok(Self { token, quotes_channel })
+        let groq = match env::var("GROQ_API_KEY") {
+            Ok(key) => {
+                ensure!(!key.trim().is_empty(), "GROQ_API_KEY is present but empty");
+                let model = env::var("GROQ_MODEL")
+                    .unwrap_or_else(|_| "qwen/qwen3.8-27b".into());
+                ensure!(!model.trim().is_empty(), "GROQ_MODEL cannot be empty");
+                let language = env::var("TOD_LANGUAGE").unwrap_or_else(|_| "ka".into());
+                ensure!(matches!(language.as_str(), "ka" | "en"), "TOD_LANGUAGE must be ka or en");
+                Some(GroqConfig { key, model, language })
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(error).context("failed to read GROQ_API_KEY"),
+        };
+
+        Ok(Self { token, quotes_channel, groq })
     }
 }
 
