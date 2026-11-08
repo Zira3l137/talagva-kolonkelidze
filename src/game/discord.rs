@@ -110,7 +110,7 @@ pub(crate) async fn create_lobby(ctx: CommandContext<'_>, category: Category) ->
 
 /// A standalone prompt requires no lobby and doesn't mutate party game state.
 pub(crate) async fn quick(ctx: CommandContext<'_>, kind: Kind, category: Category) -> Result<()> {
-    let prompt = ctx.data().prompts.draw(category, kind, None).await;
+    let prompt = ctx.data().prompts.draw(ctx.channel_id().get(), category, kind, None).await;
     ctx.say(format!(
         "**{} · {}**\n\n{prompt}\n\nYou can always skip a prompt you're uncomfortable with.",
         kind.label(),
@@ -290,7 +290,7 @@ pub(crate) async fn on_component(
             if game.phase == Phase::Choosing
                 && game.current_player() == Some(component.user.id) => {
             let kind = if action == Action::Truth { Kind::Truth } else { Kind::Dare };
-            Some(prompts.draw(game.category, kind, game.last_prompt()).await)
+            Some(prompts.draw(channel.get(), game.category, kind, game.last_prompt()).await)
         }
         _ => None,
     };

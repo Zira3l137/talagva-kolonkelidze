@@ -1,8 +1,8 @@
-//! JSON persistence for generated Truth or Dare prompts.
+//! JSON persistence for the generated Truth or Dare prompt library.
 //!
 //! The file is a small snapshot rather than a database: it is rewritten
 //! atomically (temporary file + rename) and an unreadable file never stops the
-//! bot, it only means starting with an empty cache.
+//! bot, it only means starting with an empty library.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,17 +16,23 @@ use tracing::warn;
 
 use super::{Category, Kind};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
-/// Prompts for one language, category and kind.
+/// The prompt library for one language, category and kind.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 pub(super) struct BucketData {
-    /// Generated but not yet served.
+    /// Every generated prompt, oldest first. Prompts are kept after they are
+    /// served so that other channels can reuse them without another request.
     #[serde(default)]
-    pub ready: Vec<String>,
-    /// Served recently, oldest first. Used to reject duplicates.
+    pub entries: Vec<EntryData>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(super) struct EntryData {
+    pub text: String,
+    /// Discord channel IDs that have already been served this prompt.
     #[serde(default)]
-    pub recent: Vec<String>,
+    pub seen_by: Vec<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -141,7 +147,13 @@ mod tests {
     use std::fs;
 
     use super::testing::temp_path;
-    use super::{BucketData, Category, Kind, Snapshot, Store, bucket_key};
+    use super::{BucketData, Category, EntryData, Kind, Snapshot, Store, bucket_key};
+
+    fn bucket(texts: &[&str]) -> BucketData {
+        BucketData {
+            entries: texts.iter().map(|text| EntryData { text: (*text).into(), seen_by: vec![] }).collect(),
+        }
+    }
 
     fn cleanup(store: &Store) {
         for suffix in ["", ".tmp", ".bad"] {
@@ -162,10 +174,9 @@ mod tests {
     fn snapshot_round_trips_through_disk() {
         let store = Store::new(temp_path("round-trip"));
         let mut snapshot = Snapshot::new();
-        snapshot.buckets.insert(
-            "ka/casual/truth".into(),
-            BucketData { ready: vec!["ერთი".into()], recent: vec!["ორი".into()] },
-        );
+        let mut data = bucket(&["ერთი", "ორი"]);
+        data.entries[0].seen_by = vec![1_234_567_890_123_456_789, 42];
+        snapshot.buckets.insert("ka/casual/truth".into(), data);
         store.save(1, &snapshot.to_json().unwrap()).unwrap();
         let loaded = store.load();
         assert_eq!(loaded.buckets, snapshot.buckets);
@@ -192,7 +203,7 @@ mod tests {
     fn older_snapshot_never_replaces_a_newer_one() {
         let store = Store::new(temp_path("ordering"));
         let mut newer = Snapshot::new();
-        newer.buckets.insert("ka/casual/dare".into(), BucketData { ready: vec!["new".into()], recent: vec![] });
+        newer.buckets.insert("ka/casual/dare".into(), bucket(&["new"]));
         store.save(2, &newer.to_json().unwrap()).unwrap();
         store.save(1, &Snapshot::new().to_json().unwrap()).unwrap();
         assert_eq!(store.load().buckets, newer.buckets);

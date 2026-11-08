@@ -1,12 +1,14 @@
-//! Cached AI-generated prompts with an immediate curated fallback.
+//! AI-generated prompts with an immediate curated fallback.
 //!
 //! Discord component responses must be sent promptly. We never wait for a
-//! model response during a button press: the cache refills asynchronously.
+//! model response during a button press: the library refills asynchronously.
 //!
-//! Unused prompts are saved to disk, so a restart neither loses prompts that
-//! were already paid for nor requests new ones for categories nobody plays.
+//! Generated prompts are kept in a library, saved to disk, and tracked per
+//! channel. A prompt that one channel has used is still available to every
+//! other channel, so a request to the model is only made when a channel that
+//! is actually playing is about to run out of prompts it has not seen.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -16,16 +18,17 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
 use super::groq::Groq;
+use super::library::Library;
 use super::store::{BucketData, Snapshot, Store, bucket_key};
 use super::{Category, Kind, draw, random};
 use crate::config::GroqConfig;
 
+/// Request more prompts when a channel has fewer than this many left to see.
 const REFILL_BELOW: usize = 3;
-/// How many served prompts are remembered locally to reject duplicates.
-const RECENT_LIMIT: usize = 24;
-/// How many of those are sent to the model as "do not repeat" context. Sending
-/// fewer keeps input tokens down; the larger local history still filters
-/// duplicates, and the refill log reports how many were rejected.
+/// How many of the newest library prompts are sent to the model as "do not
+/// repeat" context. Sending fewer keeps input tokens down; the whole library
+/// still filters duplicates locally, and the refill log reports how many were
+/// rejected.
 const HISTORY_SENT: usize = 6;
 const RETRY_DELAY: Duration = Duration::from_secs(90);
 
@@ -52,8 +55,7 @@ struct Cache {
 
 #[derive(Default)]
 struct Bucket {
-    ready: VecDeque<String>,
-    recently_used: VecDeque<String>,
+    library: Library,
     loading: bool,
     retry_at: Option<Instant>,
 }
@@ -64,27 +66,6 @@ struct Write {
     json: String,
 }
 
-impl Bucket {
-    fn from_data(data: BucketData) -> Self {
-        let mut recently_used: VecDeque<String> = data.recent.into_iter().collect();
-        while recently_used.len() > RECENT_LIMIT {
-            recently_used.pop_front();
-        }
-        Self {
-            ready: data.ready.into_iter().filter(|prompt| !prompt.trim().is_empty()).collect(),
-            recently_used,
-            ..Self::default()
-        }
-    }
-
-    fn to_data(&self) -> BucketData {
-        BucketData {
-            ready: self.ready.iter().cloned().collect(),
-            recent: self.recently_used.iter().cloned().collect(),
-        }
-    }
-}
-
 impl PromptService {
     pub fn new(config: Option<GroqConfig>) -> Result<Self> {
         let ai = config
@@ -93,8 +74,8 @@ impl PromptService {
         Ok(Self { ai })
     }
 
-    /// Top up categories that were already being played, without delaying
-    /// bot startup. Nothing is requested for categories nobody has used.
+    /// Top up libraries that a channel is close to exhausting, without delaying
+    /// bot startup. Nothing is requested for categories nobody has played.
     pub fn warm(&self) {
         let Some(ai) = &self.ai else {
             info!("Groq is not configured; using curated Truth or Dare prompts");
@@ -104,9 +85,11 @@ impl PromptService {
         tokio::spawn(async move { ai.warm().await });
     }
 
-    pub async fn draw(&self, category: Category, kind: Kind, previous: Option<&str>) -> String {
+    /// `channel` is the Discord channel ID: prompts are not repeated within a
+    /// channel until its library is exhausted.
+    pub async fn draw(&self, channel: u64, category: Category, kind: Kind, previous: Option<&str>) -> String {
         if let Some(ai) = &self.ai {
-            if let Some(prompt) = ai.take(category, kind, previous).await {
+            if let Some(prompt) = ai.take(channel, category, kind, previous).await {
                 return prompt;
             }
         }
@@ -125,14 +108,16 @@ impl Cache {
         for category in CATEGORIES {
             for kind in KINDS {
                 if let Some(data) = snapshot.buckets.remove(&bucket_key(&language, category, kind)) {
-                    let bucket = Bucket::from_data(data);
-                    loaded += bucket.ready.len();
-                    buckets.insert((category, kind), bucket);
+                    loaded += data.entries.len();
+                    buckets.insert(
+                        (category, kind),
+                        Bucket { library: Library::from_data(data), ..Bucket::default() },
+                    );
                 }
             }
         }
         info!(path = %store.path().display(), loaded, language = language.as_str(),
-            "loaded saved AI prompts");
+            "loaded saved AI prompt library");
 
         Ok(Self {
             provider: Groq::new(config)?,
@@ -146,47 +131,43 @@ impl Cache {
     }
 
     async fn warm(self: &Arc<Self>) {
-        let played = {
+        let wanted = {
             let buckets = self.buckets.lock().await;
-            played_buckets(&buckets)
+            refill_candidates(&buckets)
         };
-        info!(played = played.len(), "Groq prompt generation enabled; refilling categories in play");
-        for (category, kind) in played {
-            self.ensure_refill(category, kind).await;
+        info!(wanted = wanted.len(), "Groq prompt generation enabled; refilling libraries in need");
+        for (category, kind) in wanted {
+            self.start_refill(category, kind).await;
         }
     }
 
-    async fn take(self: &Arc<Self>, category: Category, kind: Kind, previous: Option<&str>) -> Option<String> {
+    async fn take(
+        self: &Arc<Self>,
+        channel: u64,
+        category: Category,
+        kind: Kind,
+        previous: Option<&str>,
+    ) -> Option<String> {
         let mut buckets = self.buckets.lock().await;
         let bucket = buckets.entry((category, kind)).or_default();
-        // Randomize within the batch and avoid repeating the previous prompt.
-        let available: Vec<usize> = bucket.ready.iter().enumerate()
-            .filter(|(_, p)| previous != Some(p.as_str()))
-            .map(|(index, _)| index)
-            .collect();
-        let prompt = if available.is_empty() {
-            None
-        } else {
-            let index = available[random::index(available.len())];
-            let prompt = bucket.ready.remove(index);
-            if let Some(ref prompt) = prompt {
-                remember(&mut bucket.recently_used, prompt);
-            }
-            prompt
-        };
+        // Randomize among prompts this channel has not seen and never repeat
+        // the previous one.
+        let prompt = bucket.library.take(channel, previous, random::index);
+        let low = bucket.library.unseen(channel) < REFILL_BELOW;
         let write = prompt.is_some().then(|| self.snapshot(&buckets)).flatten();
         drop(buckets);
         self.persist(write);
-        self.ensure_refill(category, kind).await;
+        if low {
+            self.start_refill(category, kind).await;
+        }
         prompt
     }
 
-    async fn ensure_refill(self: &Arc<Self>, category: Category, kind: Kind) {
+    /// Start a background refill unless one is running or recently failed.
+    async fn start_refill(self: &Arc<Self>, category: Category, kind: Kind) {
         let mut buckets = self.buckets.lock().await;
         let bucket = buckets.entry((category, kind)).or_default();
-        if bucket.ready.len() >= REFILL_BELOW || bucket.loading
-            || bucket.retry_at.is_some_and(|retry| Instant::now() < retry)
-        {
+        if bucket.loading || bucket.retry_at.is_some_and(|retry| Instant::now() < retry) {
             return;
         }
         bucket.loading = true;
@@ -202,7 +183,7 @@ impl Cache {
             let recent: Vec<String> = {
                 let buckets = self.buckets.lock().await;
                 buckets.get(&(category, kind))
-                    .map(|bucket| history_for_request(&bucket.recently_used))
+                    .map(|bucket| bucket.library.newest(HISTORY_SENT))
                     .unwrap_or_default()
             };
             self.provider.generate(category, kind, &recent).await
@@ -215,19 +196,11 @@ impl Cache {
         match result {
             Ok(prompts) => {
                 let generated = prompts.len();
-                let mut added = 0;
-                for prompt in prompts {
-                    if bucket.ready.iter().chain(bucket.recently_used.iter())
-                        .any(|existing| existing.eq_ignore_ascii_case(&prompt)) {
-                        continue;
-                    }
-                    bucket.ready.push_back(prompt);
-                    added += 1;
-                }
+                let added = bucket.library.add(prompts);
                 let duplicates = generated - added;
                 bucket.retry_at = if added == 0 { Some(Instant::now() + RETRY_DELAY) } else { None };
                 info!(category = category.label(), kind = kind.label(), generated, added, duplicates,
-                    "AI prompt cache refilled");
+                    "AI prompt library refilled");
                 if added > 0 {
                     write = self.snapshot(&buckets);
                 }
@@ -242,21 +215,21 @@ impl Cache {
         self.persist(write);
     }
 
-    /// Serialize the whole cache. Called with the bucket lock held so that the
-    /// sequence number reflects the order in which states existed.
+    /// Serialize the whole library. Called with the bucket lock held so that
+    /// the sequence number reflects the order in which states existed.
     fn snapshot(&self, buckets: &HashMap<(Category, Kind), Bucket>) -> Option<Write> {
         let mut snapshot = Snapshot::new();
         snapshot.buckets = self.foreign.clone();
         for (&(category, kind), bucket) in buckets {
-            if bucket.ready.is_empty() && bucket.recently_used.is_empty() {
+            if bucket.library.is_empty() {
                 continue;
             }
-            snapshot.buckets.insert(bucket_key(&self.language, category, kind), bucket.to_data());
+            snapshot.buckets.insert(bucket_key(&self.language, category, kind), bucket.library.to_data());
         }
         match snapshot.to_json() {
             Ok(json) => Some(Write { seq: self.snapshots.fetch_add(1, Ordering::Relaxed) + 1, json }),
             Err(error) => {
-                warn!(error = ?error, "could not serialize the AI prompt cache");
+                warn!(error = ?error, "could not serialize the AI prompt library");
                 None
             }
         }
@@ -268,43 +241,27 @@ impl Cache {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
             if let Err(error) = store.save(seq, &json) {
-                warn!(error = ?error, "could not save the AI prompt cache");
+                warn!(error = ?error, "could not save the AI prompt library");
             }
         });
     }
 }
 
-/// Buckets somebody has already played: only these are worth refilling at startup.
-fn played_buckets(buckets: &HashMap<(Category, Kind), Bucket>) -> Vec<(Category, Kind)> {
+/// Libraries where a channel that already plays is close to running out.
+fn refill_candidates(buckets: &HashMap<(Category, Kind), Bucket>) -> Vec<(Category, Kind)> {
     buckets.iter()
-        .filter(|(_, bucket)| !bucket.recently_used.is_empty())
+        .filter(|(_, bucket)| bucket.library.needs_refill(REFILL_BELOW))
         .map(|(&key, _)| key)
         .collect()
 }
 
-fn remember(recent: &mut VecDeque<String>, prompt: &str) {
-    recent.push_back(prompt.to_owned());
-    if recent.len() > RECENT_LIMIT {
-        recent.pop_front();
-    }
-}
-
-/// The newest `HISTORY_SENT` prompts, oldest first.
-fn history_for_request(recent: &VecDeque<String>) -> Vec<String> {
-    let skip = recent.len().saturating_sub(HISTORY_SENT);
-    recent.iter().skip(skip).cloned().collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::fs;
 
     use super::super::store::testing::temp_path;
-    use super::{
-        Bucket, Cache, Category, GroqConfig, HISTORY_SENT, Kind, RECENT_LIMIT, history_for_request,
-        played_buckets, remember,
-    };
+    use super::{Bucket, Cache, Category, GroqConfig, Kind, REFILL_BELOW, refill_candidates};
 
     fn config(language: &str, name: &str) -> GroqConfig {
         GroqConfig {
@@ -315,95 +272,78 @@ mod tests {
         }
     }
 
-    fn cleanup(config: &GroqConfig) {
-        let _ = fs::remove_file(&config.store_path);
-        let _ = fs::remove_file(format!("{}.tmp", config.store_path.display()));
-    }
-
     #[tokio::test]
     async fn without_key_uses_curated_prompts() {
         let service = super::PromptService::new(None).unwrap();
         service.warm();
-        let prompt = service.draw(super::Category::Casual, super::Kind::Truth, None).await;
+        let prompt = service.draw(1, super::Category::Casual, super::Kind::Truth, None).await;
         assert!(!prompt.is_empty());
     }
 
     #[test]
-    fn recent_prompts_are_bounded() {
-        let mut queue = VecDeque::new();
-        for index in 0..(RECENT_LIMIT + 9) {
-            remember(&mut queue, &index.to_string());
-        }
-        assert_eq!(queue.len(), RECENT_LIMIT);
-        assert_eq!(queue.front().map(String::as_str), Some("9"));
-    }
-
-    #[test]
-    fn request_history_is_the_newest_few_in_order() {
-        let mut queue = VecDeque::new();
-        for index in 0..RECENT_LIMIT {
-            remember(&mut queue, &index.to_string());
-        }
-        let sent = history_for_request(&queue);
-        assert_eq!(sent.len(), HISTORY_SENT);
-        assert_eq!(sent.first().map(String::as_str), Some((RECENT_LIMIT - HISTORY_SENT).to_string().as_str()));
-        assert_eq!(sent.last().map(String::as_str), Some((RECENT_LIMIT - 1).to_string().as_str()));
-        // A short history is sent in full.
-        let short: VecDeque<String> = ["a".to_owned(), "b".to_owned()].into();
-        assert_eq!(history_for_request(&short), ["a", "b"]);
-    }
-
-    #[test]
-    fn only_played_buckets_are_warmed() {
+    fn only_libraries_a_channel_is_exhausting_are_refilled() {
+        let texts = ["alpha one", "bravo two", "charlie three", "delta four", "echo five"];
         let mut buckets = HashMap::new();
-        let mut played = Bucket::default();
-        played.recently_used.push_back("served once".into());
-        buckets.insert((Category::Casual, Kind::Truth), played);
-        // Prompts that were generated but never served do not justify a request.
+
+        // Played, and one channel has only two prompts left: refill.
+        let mut busy = Bucket::default();
+        busy.library.add(texts.map(String::from));
+        for _ in 0..(texts.len() - REFILL_BELOW + 1) {
+            busy.library.take(1, None, |_| 0);
+        }
+        buckets.insert((Category::Casual, Kind::Truth), busy);
+
+        // Stocked but never played: no request just because it exists.
         let mut stocked = Bucket::default();
-        stocked.ready.push_back("never served".into());
+        stocked.library.add(texts.map(String::from));
         buckets.insert((Category::Romantic, Kind::Dare), stocked);
-        buckets.insert((Category::Personal, Kind::Truth), Bucket::default());
-        assert_eq!(played_buckets(&buckets), [(Category::Casual, Kind::Truth)]);
+
+        // Played lightly: plenty left for everyone who used it.
+        let mut light = Bucket::default();
+        light.library.add(texts.map(String::from));
+        light.library.take(1, None, |_| 0);
+        buckets.insert((Category::Personal, Kind::Truth), light);
+
+        buckets.insert((Category::Personal, Kind::Dare), Bucket::default());
+        assert_eq!(refill_candidates(&buckets), [(Category::Casual, Kind::Truth)]);
     }
 
     #[tokio::test]
-    async fn cache_survives_a_restart_and_keeps_other_languages() {
-        let georgian = config("ka", "restart-ka");
+    async fn library_and_seen_state_survive_a_restart_and_keep_other_languages() {
+        let path = config("ka", "restart").store_path;
         {
-            let cache = Cache::open(config("ka", "restart-ka")).unwrap();
+            let cache = Cache::open(config("ka", "restart")).unwrap();
             let mut buckets = cache.buckets.lock().await;
             let bucket = buckets.entry((Category::Casual, Kind::Truth)).or_default();
-            // Enough stock that serving one prompt starts no network refill.
-            for index in 0..5 {
-                bucket.ready.push_back(format!("ready {index}"));
-            }
-            bucket.recently_used.push_back("served".into());
+            bucket.library.add((0..5).map(|index| format!("ready prompt {index}")));
+            // Serve one prompt directly from the library (no network refill).
+            bucket.library.take(77, None, |_| 0);
             let write = cache.snapshot(&buckets).unwrap();
             drop(buckets);
             cache.store.save(write.seq, &write.json).unwrap();
         }
 
-        // Same file, same language: everything is restored.
-        let cache = Cache::open(config("ka", "restart-ka")).unwrap();
+        // Same file and language: prompts and what channel 77 has seen are restored.
+        let cache = Cache::open(config("ka", "restart")).unwrap();
         {
             let buckets = cache.buckets.lock().await;
-            let bucket = &buckets[&(Category::Casual, Kind::Truth)];
-            assert_eq!(bucket.ready.len(), 5);
-            assert_eq!(bucket.recently_used, ["served"]);
+            let library = &buckets[&(Category::Casual, Kind::Truth)].library;
+            assert_eq!(library.unseen(77), 4);
+            assert_eq!(library.unseen(78), 5);
         }
 
         // Another language starts empty, and saving does not discard Georgian prompts.
-        let english = Cache::open(config("en", "restart-ka")).unwrap();
+        let english = Cache::open(config("en", "restart")).unwrap();
         {
             let buckets = english.buckets.lock().await;
             assert!(buckets.is_empty());
             let write = english.snapshot(&buckets).unwrap();
             english.store.save(write.seq, &write.json).unwrap();
         }
-        let again = Cache::open(config("ka", "restart-ka")).unwrap();
-        assert_eq!(again.buckets.lock().await[&(Category::Casual, Kind::Truth)].ready.len(), 5);
+        let again = Cache::open(config("ka", "restart")).unwrap();
+        assert_eq!(again.buckets.lock().await[&(Category::Casual, Kind::Truth)].library.unseen(77), 4);
 
-        cleanup(&georgian);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}.tmp", path.display()));
     }
 }
