@@ -8,7 +8,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     let intents =
         serenity::GatewayIntents::non_privileged() | serenity::GatewayIntents::MESSAGE_CONTENT;
     let quotes_channel = config.quotes_channel;
-    let groq = config.groq;
+    let (ai, tod) = (config.ai, config.tod);
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -54,7 +54,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                 poise::builtins::register_globally(ctx, &framework.options().commands)
                     .await
                     .context("failed to register Discord slash commands")?;
-                let prompts = game::PromptService::new(groq)
+                let prompts = game::PromptService::new(ai, tod)
                     .context("failed to initialize prompt generation")?;
                 prompts.warm();
                 Ok(Data {

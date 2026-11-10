@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::Category;
 use super::Kind;
-use crate::config::GroqConfig;
+use crate::config::AiConfig;
 
 const URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const BATCH_SIZE: usize = 8;
@@ -46,12 +46,12 @@ struct Batch {
 }
 
 impl Groq {
-    pub fn new(config: GroqConfig) -> Result<Self> {
+    pub fn new(config: AiConfig, language: String) -> Result<Self> {
         let http = Client::builder()
             .timeout(Duration::from_secs(20))
             .build()
             .context("failed to configure Groq HTTP client")?;
-        Ok(Self { http, key: config.key, model: config.model, language: config.language })
+        Ok(Self { http, key: config.key, model: config.model, language })
     }
 
     pub async fn generate(

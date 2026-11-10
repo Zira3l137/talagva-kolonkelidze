@@ -21,7 +21,7 @@ use super::groq::Groq;
 use super::library::Library;
 use super::store::{BucketData, Snapshot, Store, bucket_key};
 use super::{Category, Kind, draw, random};
-use crate::config::GroqConfig;
+use crate::config::{AiConfig, TodConfig};
 
 /// Request more prompts when a channel has fewer than this many left to see.
 const REFILL_BELOW: usize = 3;
@@ -67,9 +67,9 @@ struct Write {
 }
 
 impl PromptService {
-    pub fn new(config: Option<GroqConfig>) -> Result<Self> {
-        let ai = config
-            .map(|config| Cache::open(config).map(Arc::new))
+    pub fn new(ai: Option<AiConfig>, tod: TodConfig) -> Result<Self> {
+        let ai = ai
+            .map(|ai| Cache::open(ai, tod).map(Arc::new))
             .transpose()?;
         Ok(Self { ai })
     }
@@ -98,9 +98,9 @@ impl PromptService {
 }
 
 impl Cache {
-    fn open(config: GroqConfig) -> Result<Self> {
-        let language = config.language.clone();
-        let store = Store::new(config.store_path.clone());
+    fn open(ai: AiConfig, tod: TodConfig) -> Result<Self> {
+        let TodConfig { language, store_path } = tod;
+        let store = Store::new(store_path);
         let mut snapshot = store.load();
 
         let mut buckets = HashMap::new();
@@ -120,7 +120,7 @@ impl Cache {
             "loaded saved AI prompt library");
 
         Ok(Self {
-            provider: Groq::new(config)?,
+            provider: Groq::new(ai, language.clone())?,
             language,
             store: Arc::new(store),
             foreign: snapshot.buckets,
@@ -261,20 +261,19 @@ mod tests {
     use std::fs;
 
     use super::super::store::testing::temp_path;
-    use super::{Bucket, Cache, Category, GroqConfig, Kind, REFILL_BELOW, refill_candidates};
+    use super::{AiConfig, Bucket, Cache, Category, Kind, REFILL_BELOW, TodConfig, refill_candidates};
 
-    fn config(language: &str, name: &str) -> GroqConfig {
-        GroqConfig {
-            key: "test-key".into(),
-            model: "test-model".into(),
-            language: language.into(),
-            store_path: temp_path(name),
-        }
+    fn ai() -> AiConfig {
+        AiConfig { key: "test-key".into(), model: "test-model".into() }
+    }
+
+    fn tod(language: &str, name: &str) -> TodConfig {
+        TodConfig { language: language.into(), store_path: temp_path(name) }
     }
 
     #[tokio::test]
     async fn without_key_uses_curated_prompts() {
-        let service = super::PromptService::new(None).unwrap();
+        let service = super::PromptService::new(None, tod("ka", "no-key")).unwrap();
         service.warm();
         let prompt = service.draw(1, super::Category::Casual, super::Kind::Truth, None).await;
         assert!(!prompt.is_empty());
@@ -310,9 +309,9 @@ mod tests {
 
     #[tokio::test]
     async fn library_and_seen_state_survive_a_restart_and_keep_other_languages() {
-        let path = config("ka", "restart").store_path;
+        let path = tod("ka", "restart").store_path;
         {
-            let cache = Cache::open(config("ka", "restart")).unwrap();
+            let cache = Cache::open(ai(), tod("ka", "restart")).unwrap();
             let mut buckets = cache.buckets.lock().await;
             let bucket = buckets.entry((Category::Casual, Kind::Truth)).or_default();
             bucket.library.add((0..5).map(|index| format!("ready prompt {index}")));
@@ -324,7 +323,7 @@ mod tests {
         }
 
         // Same file and language: prompts and what channel 77 has seen are restored.
-        let cache = Cache::open(config("ka", "restart")).unwrap();
+        let cache = Cache::open(ai(), tod("ka", "restart")).unwrap();
         {
             let buckets = cache.buckets.lock().await;
             let library = &buckets[&(Category::Casual, Kind::Truth)].library;
@@ -333,14 +332,14 @@ mod tests {
         }
 
         // Another language starts empty, and saving does not discard Georgian prompts.
-        let english = Cache::open(config("en", "restart")).unwrap();
+        let english = Cache::open(ai(), tod("en", "restart")).unwrap();
         {
             let buckets = english.buckets.lock().await;
             assert!(buckets.is_empty());
             let write = english.snapshot(&buckets).unwrap();
             english.store.save(write.seq, &write.json).unwrap();
         }
-        let again = Cache::open(config("ka", "restart")).unwrap();
+        let again = Cache::open(ai(), tod("ka", "restart")).unwrap();
         assert_eq!(again.buckets.lock().await[&(Category::Casual, Kind::Truth)].library.unseen(77), 4);
 
         let _ = fs::remove_file(&path);
