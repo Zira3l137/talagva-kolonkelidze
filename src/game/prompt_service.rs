@@ -14,14 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::groq::Groq;
+use super::generator::PromptGenerator;
 use super::library::Library;
 use super::store::{BucketData, Snapshot, Store, bucket_key};
 use super::{Category, Kind, draw, random};
-use crate::config::{AiConfig, TodConfig};
+use crate::ai::AiClient;
+use crate::config::TodConfig;
 
 /// Request more prompts when a channel has fewer than this many left to see.
 const REFILL_BELOW: usize = 3;
@@ -41,7 +42,7 @@ pub(crate) struct PromptService {
 }
 
 struct Cache {
-    provider: Groq,
+    generator: PromptGenerator,
     language: String,
     store: Arc<Store>,
     /// Buckets for other languages, kept verbatim so that switching
@@ -49,8 +50,6 @@ struct Cache {
     foreign: BTreeMap<String, BucketData>,
     snapshots: AtomicU64,
     buckets: Mutex<HashMap<(Category, Kind), Bucket>>,
-    // Keep free-tier usage predictable, including on first warmup.
-    limit: Semaphore,
 }
 
 #[derive(Default)]
@@ -67,7 +66,8 @@ struct Write {
 }
 
 impl PromptService {
-    pub fn new(ai: Option<AiConfig>, tod: TodConfig) -> Result<Self> {
+    /// Without a client, only the built-in prompts are used.
+    pub fn new(ai: Option<Arc<AiClient>>, tod: TodConfig) -> Result<Self> {
         let ai = ai
             .map(|ai| Cache::open(ai, tod).map(Arc::new))
             .transpose()?;
@@ -98,7 +98,7 @@ impl PromptService {
 }
 
 impl Cache {
-    fn open(ai: AiConfig, tod: TodConfig) -> Result<Self> {
+    fn open(ai: Arc<AiClient>, tod: TodConfig) -> Result<Self> {
         let TodConfig { language, store_path } = tod;
         let store = Store::new(store_path);
         let mut snapshot = store.load();
@@ -120,13 +120,12 @@ impl Cache {
             "loaded saved AI prompt library");
 
         Ok(Self {
-            provider: Groq::new(ai, language.clone())?,
+            generator: PromptGenerator::new(ai, language.clone()),
             language,
             store: Arc::new(store),
             foreign: snapshot.buckets,
             snapshots: AtomicU64::new(0),
             buckets: Mutex::new(buckets),
-            limit: Semaphore::new(1),
         })
     }
 
@@ -177,16 +176,15 @@ impl Cache {
     }
 
     async fn refill(self: Arc<Self>, category: Category, kind: Kind) {
-        // The permit and network request never run while a cache mutex is held.
+        // The network request never runs while a cache mutex is held.
         let result: Result<Vec<String>> = async {
-            let _permit = self.limit.acquire().await?;
             let recent: Vec<String> = {
                 let buckets = self.buckets.lock().await;
                 buckets.get(&(category, kind))
                     .map(|bucket| bucket.library.newest(HISTORY_SENT))
                     .unwrap_or_default()
             };
-            self.provider.generate(category, kind, &recent).await
+            self.generator.generate(category, kind, &recent).await
         }.await;
 
         let mut buckets = self.buckets.lock().await;
@@ -261,10 +259,12 @@ mod tests {
     use std::fs;
 
     use super::super::store::testing::temp_path;
-    use super::{AiConfig, Bucket, Cache, Category, Kind, REFILL_BELOW, TodConfig, refill_candidates};
+    use super::{AiClient, Arc, Bucket, Cache, Category, Kind, REFILL_BELOW, TodConfig, refill_candidates};
+    use crate::config::AiConfig;
 
-    fn ai() -> AiConfig {
-        AiConfig { key: "test-key".into(), model: "test-model".into() }
+    fn ai() -> Arc<AiClient> {
+        let config = AiConfig { key: "test-key".into(), model: "test-model".into() };
+        Arc::new(AiClient::new(config).unwrap())
     }
 
     fn tod(language: &str, name: &str) -> TodConfig {

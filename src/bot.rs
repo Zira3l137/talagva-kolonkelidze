@@ -1,14 +1,24 @@
+use std::sync::Arc;
+
 use anyhow::{Context as _, Result};
 use poise::serenity_prelude as serenity;
 use tracing::{error, info};
 
-use crate::{commands, config::Config, game, Data, Error};
+use crate::{ai::AiClient, commands, config::Config, game, Data, Error};
 
 pub(crate) async fn run(config: Config) -> Result<()> {
     let intents =
         serenity::GatewayIntents::non_privileged() | serenity::GatewayIntents::MESSAGE_CONTENT;
     let quotes_channel = config.quotes_channel;
-    let (ai, tod) = (config.ai, config.tod);
+    // One client for the whole bot: every feature that talks to the model shares
+    // its credentials and its request limit.
+    let ai = config
+        .ai
+        .map(AiClient::new)
+        .transpose()
+        .context("failed to initialize the AI client")?
+        .map(Arc::new);
+    let tod = config.tod;
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {

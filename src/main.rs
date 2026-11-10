@@ -1,3 +1,4 @@
+mod ai;
 mod bot;
 mod commands;
 mod config;

@@ -1,43 +1,24 @@
-//! Minimal Groq chat-completions client. No Discord dependencies or global state.
+//! Truth or Dare prompt generation: what we ask the model for and how its
+//! answer is filtered. The HTTP round trip lives in `crate::ai`.
 
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use anyhow::Result;
-use anyhow::anyhow;
 use anyhow::bail;
-use reqwest::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::Category;
 use super::Kind;
-use crate::config::AiConfig;
+use crate::ai::AiClient;
+use crate::ai::Chat;
 
-const URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const BATCH_SIZE: usize = 8;
 
-pub(super) struct Groq {
-    http: Client,
-    key: String,
-    model: String,
+pub(super) struct PromptGenerator {
+    ai: Arc<AiClient>,
     language: String,
-}
-
-#[derive(Deserialize)]
-struct Completion {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: Message,
-}
-
-#[derive(Deserialize)]
-struct Message {
-    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -45,13 +26,9 @@ struct Batch {
     prompts: Vec<String>,
 }
 
-impl Groq {
-    pub fn new(config: AiConfig, language: String) -> Result<Self> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .context("failed to configure Groq HTTP client")?;
-        Ok(Self { http, key: config.key, model: config.model, language })
+impl PromptGenerator {
+    pub fn new(ai: Arc<AiClient>, language: String) -> Self {
+        Self { ai, language }
     }
 
     pub async fn generate(
@@ -98,64 +75,25 @@ impl Groq {
             kind = kind.label(),
         );
         // Do not send any messages or member data. Only prompts already served by this bot.
-        let request = json!({
-            "model": self.model,
-            "temperature": 0.9,
-            "max_completion_tokens": 2000,
-            "messages": [
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": format!(
-                    "Avoid rewriting or repeating these previous prompts: {}",
-                    serde_json::to_string(recent).context("failed to serialize recent prompts")?
-                )},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "truth_or_dare_batch",
-                    "strict": true,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "prompts": {"type": "array", "items": {"type": "string"}}
-                        },
-                        "required": ["prompts"],
-                        "additionalProperties": false
-                    }
-                }
-            }
-        });
-
-        let response = self
-            .http
-            .post(URL)
-            .bearer_auth(&self.key)
-            .json(&request)
-            .send()
-            .await
-            .context("failed to reach Groq")?;
-
-        match response.status() {
-            StatusCode::OK => {}
-            StatusCode::TOO_MANY_REQUESTS => {
-                bail!("Groq request quota or rate limit reached (HTTP 429)")
-            }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                bail!(
-                    "Groq rejected the API credentials or model permissions (HTTP {})",
-                    response.status()
-                );
-            }
-            status => bail!("Groq returned HTTP {status}"),
-        }
-
-        let body: Completion = response.json().await.context("failed to decode Groq response")?;
-        let content = body
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.as_deref())
-            .ok_or_else(|| anyhow!("Groq returned no message content"))?;
-        parse_batch(content)
+        let recent = serde_json::to_string(recent).context("failed to serialize recent prompts")?;
+        let chat = Chat::new(
+            instructions,
+            format!("Avoid rewriting or repeating these previous prompts: {recent}"),
+        )
+        .temperature(0.9)
+        .max_tokens(2000)
+        .json_schema(
+            "truth_or_dare_batch",
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompts": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["prompts"],
+                "additionalProperties": false
+            }),
+        );
+        parse_batch(&self.ai.chat(chat).await?)
     }
 }
 

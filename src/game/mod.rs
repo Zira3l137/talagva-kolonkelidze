@@ -1,6 +1,6 @@
 //! Truth or Dare rules, prompts, and Discord integration.
 
-mod groq;
+mod generator;
 mod library;
 mod prompt_service;
 mod prompts;
