@@ -36,6 +36,9 @@ pub(crate) async fn summary(
     #[min = 5]
     #[max = 300]
     count: Option<u8>,
+    #[description = "In what language to write a summary (default English)"] language: Option<
+        SummaryLanguage,
+    >,
 ) -> Result<(), Error> {
     let Some(ai) = ctx.data().ai.clone() else {
         ctx.say("AI is not configured on this bot.").await?;
@@ -77,10 +80,15 @@ pub(crate) async fn summary(
         ctx.say("There's nothing to summarize here yet.").await?;
         return Ok(());
     }
+    let transcript_lang = language.unwrap_or(SummaryLanguage::English);
 
-    let request =
-        Chat::new(INSTRUCTIONS, format!("Transcript of the last {used} messages:\n\n{transcript}"))
-            .temperature(0.3);
+    let request = Chat::new(
+        INSTRUCTIONS,
+        format!(
+            "Transcript of the last {used} messages written in {transcript_lang} language:\n\n{transcript}"
+        ),
+    )
+    .temperature(0.3);
     let summary = ai.chat(request).await?;
 
     info!(user_id = %ctx.author().id, channel_id = %ctx.channel_id(), messages = used, "channel summarized");
@@ -99,6 +107,24 @@ pub(crate) async fn summary(
 /// can fix, so it deserves a clear message instead of a generic failure.
 fn is_forbidden(error: &SerenityError) -> bool {
     matches!(error, SerenityError::Http(HttpError::UnsuccessfulRequest(response)) if response.status_code.as_u16() == 403)
+}
+
+#[derive(Debug, Default, poise::ChoiceParameter)]
+enum SummaryLanguage {
+    #[default]
+    #[name = "English"]
+    English,
+    #[name = "Georgian"]
+    Georgian,
+}
+
+impl std::fmt::Display for SummaryLanguage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::English => write!(f, "English"),
+            Self::Georgian => write!(f, "Georgian"),
+        }
+    }
 }
 
 /// One message, prepared for the model. Formatting is independent of Discord
