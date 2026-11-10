@@ -1,9 +1,13 @@
 use poise::CreateReply;
-use poise::serenity_prelude::{CreateAllowedMentions, Error as SerenityError, GetMessages, HttpError};
+use poise::serenity_prelude::CreateAllowedMentions;
+use poise::serenity_prelude::Error as SerenityError;
+use poise::serenity_prelude::GetMessages;
+use poise::serenity_prelude::HttpError;
 use tracing::info;
 
+use crate::CommandContext;
+use crate::Error;
 use crate::ai::Chat;
-use crate::{CommandContext, Error};
 
 const DEFAULT_MESSAGES: u8 = 100;
 /// A single long message cannot crowd out the rest of the conversation.
@@ -30,7 +34,7 @@ pub(crate) async fn summary(
     ctx: CommandContext<'_>,
     #[description = "How many recent messages to read (default 100)"]
     #[min = 5]
-    #[max = 100]
+    #[max = 300]
     count: Option<u8>,
 ) -> Result<(), Error> {
     let Some(ai) = ctx.data().ai.clone() else {
@@ -74,8 +78,9 @@ pub(crate) async fn summary(
         return Ok(());
     }
 
-    let request = Chat::new(INSTRUCTIONS, format!("Transcript of the last {used} messages:\n\n{transcript}"))
-        .temperature(0.3);
+    let request =
+        Chat::new(INSTRUCTIONS, format!("Transcript of the last {used} messages:\n\n{transcript}"))
+            .temperature(0.3);
     let summary = ai.chat(request).await?;
 
     info!(user_id = %ctx.author().id, channel_id = %ctx.channel_id(), messages = used, "channel summarized");
@@ -119,7 +124,8 @@ impl Entry {
             return None;
         }
         if text.chars().count() > MAX_MESSAGE_CHARS {
-            text = text.chars().take(MAX_MESSAGE_CHARS).collect::<String>().trim_end().to_owned() + "…";
+            text = text.chars().take(MAX_MESSAGE_CHARS).collect::<String>().trim_end().to_owned()
+                + "…";
         }
         Some(Self { author: author.split_whitespace().collect::<Vec<_>>().join(" "), text })
     }
@@ -159,7 +165,11 @@ fn clip(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, MAX_MESSAGE_CHARS, MAX_SUMMARY_CHARS, clip, transcript};
+    use super::Entry;
+    use super::MAX_MESSAGE_CHARS;
+    use super::MAX_SUMMARY_CHARS;
+    use super::clip;
+    use super::transcript;
 
     fn entry(author: &str, text: &str) -> Entry {
         Entry::new(author, text, 0).unwrap()
@@ -207,7 +217,8 @@ mod tests {
 
     #[test]
     fn a_full_hundred_messages_stay_within_the_budget() {
-        let entries: Vec<Entry> = (0..100).map(|i| entry(&format!("user{i}"), &"x".repeat(MAX_MESSAGE_CHARS))).collect();
+        let entries: Vec<Entry> =
+            (0..100).map(|i| entry(&format!("user{i}"), &"x".repeat(MAX_MESSAGE_CHARS))).collect();
         let (text, kept) = transcript(&entries, super::TRANSCRIPT_BUDGET);
         assert!(text.chars().count() <= super::TRANSCRIPT_BUDGET);
         assert!(kept < 100 && kept > 0);
