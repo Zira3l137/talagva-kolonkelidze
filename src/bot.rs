@@ -22,7 +22,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![commands::enquote(), commands::tod()],
+            commands: vec![commands::enquote(), commands::summary(), commands::tod()],
             event_handler: |framework, event| {
                 Box::pin(async move {
                     if let serenity::FullEvent::InteractionCreate { interaction } = event {
@@ -64,13 +64,14 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                 poise::builtins::register_globally(ctx, &framework.options().commands)
                     .await
                     .context("failed to register Discord slash commands")?;
-                let prompts = game::PromptService::new(ai, tod)
+                let prompts = game::PromptService::new(ai.clone(), tod)
                     .context("failed to initialize prompt generation")?;
                 prompts.warm();
                 Ok(Data {
                     quotes_channel,
                     games: game::discord::Games::default(),
                     prompts,
+                    ai,
                 })
             })
         })

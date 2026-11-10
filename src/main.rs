@@ -16,6 +16,8 @@ pub(crate) struct Data {
     quotes_channel: ChannelId,
     games: game::discord::Games,
     prompts: game::PromptService,
+    /// Present when `GROQ_API_KEY` is set; shared with the prompt service.
+    ai: Option<std::sync::Arc<ai::AiClient>>,
 }
 
 #[tokio::main]
