@@ -1,10 +1,17 @@
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+use anyhow::Context as _;
+use anyhow::Result;
 use poise::serenity_prelude as serenity;
-use tracing::{error, info};
+use tracing::error;
+use tracing::info;
 
-use crate::{ai::AiClient, commands, config::Config, game, Data, Error};
+use crate::Data;
+use crate::Error;
+use crate::ai::AiClient;
+use crate::commands;
+use crate::config::Config;
+use crate::game;
 
 pub(crate) async fn run(config: Config) -> Result<()> {
     let intents =
@@ -22,7 +29,12 @@ pub(crate) async fn run(config: Config) -> Result<()> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![commands::enquote(), commands::summary(), commands::tod()],
+            commands: vec![
+                commands::enquote(),
+                commands::summary(),
+                commands::tod(),
+                commands::what(),
+            ],
             event_handler: |framework, event| {
                 Box::pin(async move {
                     if let serenity::FullEvent::InteractionCreate { interaction } = event {
@@ -67,12 +79,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                 let prompts = game::PromptService::new(ai.clone(), tod)
                     .context("failed to initialize prompt generation")?;
                 prompts.warm();
-                Ok(Data {
-                    quotes_channel,
-                    games: game::discord::Games::default(),
-                    prompts,
-                    ai,
-                })
+                Ok(Data { quotes_channel, games: game::discord::Games::default(), prompts, ai })
             })
         })
         .build();
