@@ -1,3 +1,4 @@
 /target
 /.env
 /prompt_store.json*
+/movie_store.json*

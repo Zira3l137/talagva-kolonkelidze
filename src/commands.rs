@@ -1,8 +1,10 @@
+mod movies;
 mod quote;
 mod summary;
 mod tod;
 mod what;
 
+pub(crate) use movies::{forget, moviepoll, suggest};
 pub(crate) use quote::enquote;
 pub(crate) use summary::summary;
 pub(crate) use tod::tod;

@@ -12,6 +12,7 @@ use crate::ai::AiClient;
 use crate::commands;
 use crate::config::Config;
 use crate::game;
+use crate::movies::MovieStore;
 
 pub(crate) async fn run(config: Config) -> Result<()> {
     let intents =
@@ -26,6 +27,8 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         .context("failed to initialize the AI client")?
         .map(Arc::new);
     let tod = config.tod;
+    let movies = MovieStore::open(config.movie_store_path)
+        .context("failed to load the movie suggestion store")?;
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -34,6 +37,9 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                 commands::summary(),
                 commands::tod(),
                 commands::what(),
+                commands::suggest(),
+                commands::forget(),
+                commands::moviepoll(),
             ],
             event_handler: |framework, event| {
                 Box::pin(async move {
@@ -79,7 +85,13 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                 let prompts = game::PromptService::new(ai.clone(), tod)
                     .context("failed to initialize prompt generation")?;
                 prompts.warm();
-                Ok(Data { quotes_channel, games: game::discord::Games::default(), prompts, ai })
+                Ok(Data {
+                    quotes_channel,
+                    games: game::discord::Games::default(),
+                    prompts,
+                    movies: tokio::sync::Mutex::new(movies),
+                    ai,
+                })
             })
         })
         .build();

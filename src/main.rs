@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod game;
 mod logging;
+mod movies;
 
 use anyhow::{Context as _, Result};
 use poise::serenity_prelude::ChannelId;
@@ -16,6 +17,8 @@ pub(crate) struct Data {
     quotes_channel: ChannelId,
     games: game::discord::Games,
     prompts: game::PromptService,
+    /// One persistent suggestion queue per Discord channel.
+    movies: tokio::sync::Mutex<movies::MovieStore>,
     /// Present when `GROQ_API_KEY` is set; shared with the prompt service.
     ai: Option<std::sync::Arc<ai::AiClient>>,
 }

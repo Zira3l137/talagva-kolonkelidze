@@ -11,6 +11,8 @@ pub(crate) struct Config {
     /// Present only when `GROQ_API_KEY` is set.
     pub ai: Option<AiConfig>,
     pub tod: TodConfig,
+    /// JSON file holding per-channel movie suggestions between restarts.
+    pub movie_store_path: PathBuf,
 }
 
 /// Credentials for the model provider. Anything that talks to the model
@@ -69,7 +71,17 @@ impl Config {
             Err(error) => return Err(error).context("failed to read GROQ_API_KEY"),
         };
 
-        Ok(Self { token, quotes_channel, ai, tod: TodConfig::from_env()? })
+        let movie_store_path = env::var("MOVIE_STORE_PATH")
+            .unwrap_or_else(|_| "movie_store.json".into());
+        ensure!(!movie_store_path.trim().is_empty(), "MOVIE_STORE_PATH cannot be empty");
+
+        Ok(Self {
+            token,
+            quotes_channel,
+            ai,
+            tod: TodConfig::from_env()?,
+            movie_store_path: PathBuf::from(movie_store_path),
+        })
     }
 }
 
